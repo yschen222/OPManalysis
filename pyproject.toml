@@ -1,9 +1,9 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "opmanalysis"
+name = "opmtool"
 version = "0.1.0"
 description = "Fitting and preprocessing tools for optically pumped magnetometers"
 authors = [{ name = "Yi-Hsuan Chen", email = "yschen222@gmail.com" }]
