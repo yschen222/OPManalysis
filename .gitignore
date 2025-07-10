@@ -25,5 +25,3 @@ Thumbs.db
 dist/
 build/
 
-# Personal test files or demo data (optional)
-examples/Demo_data/
