@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# VSCode/Spyder/Anaconda settings
+.vscode/
+.spyderproject
+.spyproject
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Package metadata
+*.egg-info/
+dist/
+build/
+
+# Personal test files or demo data (optional)
+examples/Demo_data/
