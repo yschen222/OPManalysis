@@ -24,7 +24,7 @@ absorption signals, demodulated signals, and magnetic field sweeps.
 In your working directory (where `pyproject.toml` is located), run:
 
 ```bash
-pip install -e .
+pip install git+https://github.com/yschen222/OPManalysis .
 ```
 
 > You can now import the package with:
