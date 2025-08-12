@@ -105,13 +105,13 @@ def noise_psd(data, targetf, half_bw):
         noise,
         fs=fs,
         window='boxcar',
-        scaling='spectrum',
+        scaling='density',
         detrend=False
     )
     pts = np.column_stack((f, Pxx))
 
     mask = (f >= targetf - half_bw) & (f <= targetf + half_bw)
-    noise_psd = np.sqrt(Pxx[mask])      # V/√Hz
-    mean_rms = noise_psd.mean()
+    mean_noise = Pxx[mask].mean()
+    mean_rms = np.sqrt(mean_noise)              # V/√Hz
 
     return pts, mean_rms, fs
