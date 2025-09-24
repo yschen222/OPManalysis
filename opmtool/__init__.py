@@ -8,6 +8,8 @@ Created on Wed Jul  9 14:17:01 2025
 from .fittingtool import (
     lorentz_fit,
     gauss_fit,
+    voigt_fit,
+    asymmetric_lorentz_fit,
     dispersion_lorentz_fit,
     linear_region_fit
 )
