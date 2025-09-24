@@ -13,59 +13,234 @@ from scipy.signal import periodogram
 Initial data processing
 """
 
-def one_cycle_cut(data, sweepB, sweepf):
+def one_cycle_cut(
+    data,
+    B_range,
+    cycles=1,
+    segment='half',                # 'half' (rising-only / falling-only) or 'full' (rise+fall)
+    direction='auto',              # 'auto' | 'rising' | 'falling' (used for 'half')
+    time_col='time',
+    ab_col='Ab',
+    demod_col='demod',
+    tri_col='tri',                 # required triangle/sawtooth column
+    smooth_win=5,                  # smoothing window (samples) for the triangle
+    anchor='abspeak',              # 'abspeak' | 'center' | 'first' | 'last'
+    edge_clip_frac=0.02,           # clip 2% from both ends of the chosen segment(s)
+    map_mode='global',             # 'global' (default) | 'local'  ← see docstring
+    require_tri=True,
+    return_debug=False
+):
     """
-    Automatically extracts a full sweep cycle centered at the absorption peak, and converts the time axis into magnetic field values based on a known triangular ramp function.
+    Cut one or more sweep segments **using the measured triangle/sawtooth waveform only**
+    and convert the selected segment(s) to magnetic field values according to the given
+    (B_min, B_max).
 
+    This function is designed for OPM scans where each record often contains only a
+    rising ramp or only a falling ramp (i.e., sawtooth). Segmentation relies solely
+    on the triangle/sawtooth monotonic runs; the absorption signal is used only to
+    choose an anchor segment when requested, and never to decide the boundaries.
 
-    Parameters:
-        data : DataFrame or ndarray
-            Columns = [time, Ab, demod] or [t, Ab, demod]
+    Parameters
+    ----------
+    data : pandas.DataFrame or ndarray
+        - DataFrame must include columns: [time_col, ab_col, demod_col, tri_col].
+        - ndarray must be shape (N,4): [t, Ab, demod, tri].
+    B_range : (float, float)
+        (B_min, B_max) corresponding to the triangle extrema for *one sweep*.
+        Units are arbitrary but must match your intended nT scale.
+    cycles : int, optional
+        Number of consecutive segments to cut.
+        * For segment='half', this is the number of half-cycles (rising-only or falling-only).
+        * For segment='full', each cycle contains one rising + one falling run.
+    segment : {'half','full'}, optional
+        - 'half': cut strictly monotonic runs (min→max rising, or max→min falling).
+        - 'full': cut peak-to-peak windows (rise+fall), detected by turning points.
+    direction : {'auto','rising','falling'}, optional
+        Which half to select when segment='half'.
+        - 'auto' infers from the derivative sign distribution of the triangle.
+    time_col, ab_col, demod_col, tri_col : str
+        Column names (used only when `data` is a DataFrame).
+    smooth_win : int, optional
+        Moving-average window (in samples) for the triangle to make segmentation robust.
+        Set <=1 to disable smoothing.
+    anchor : {'abspeak','center','first','last'}, optional
+        Which segment to start from before stitching `cycles` consecutive segments:
+        - 'abspeak': the segment containing max |Ab - baseline| (baseline from edges).
+        - 'center' : the segment near the middle of the record.
+        - 'first'  : the earliest valid segment.
+        - 'last'   : the latest valid segment.
+    edge_clip_frac : float, optional
+        Fraction of samples to drop from each end of the chosen segment(s) to avoid
+        turn-around artifacts and coil dynamics (e.g., 0.02 = 2%).
+    map_mode : {'global','local'}, optional
+        How to map triangle values to B after edge clipping:
+        - 'global' (recommended, default): use the **pre-clip** min/max of the chosen
+          segment(s) to map to (B_min, B_max). This means after clipping 2% the resulting
+          `BField` will **not** be stretched back to ±range; it naturally stays *within*
+          your requested range (e.g., ±34 nT).
+        - 'local': use the **post-clip** min/max to map to (B_min, B_max).
+          This stretches the clipped segment back to full range (typically *not* what you want).
+    require_tri : bool, optional
+        If True, raise if triangle column is missing (recommended).
+    return_debug : bool, optional
+        If True, also return a debug dict with segmentation details.
 
-        sweepB : float
-            Sweep amplitude (e.g., nT)
+    Returns
+    -------
+    BField : ndarray
+        Magnetic field axis mapped from the triangle according to `map_mode`.
+    AbCut : ndarray
+        Absorption signal cut to the selected segment(s).
+    DemodCut : ndarray
+        Demodulated (lock-in) signal cut to the selected segment(s).
+    debug : dict (only if return_debug=True)
+        Keys include:
+        - 'direction'     : 'rising' or 'falling' used for 'half'
+        - 'runs'          : list of (start, end) monotonic runs on the triangle
+        - 'chosen_full'   : (s_full, e_full) indices before edge clipping
+        - 'chosen_clipped': (s0, e0) indices after edge clipping
+        - 'tri_span_full' : (min, max) of the pre-clip triangle in the chosen runs
+        - 'tri_span_local': (min, max) of the post-clip triangle
+        - 'map_mode'      : 'global' or 'local'
 
-        sweepf : float
-            Sweep frequency of triangle ramp function (Hz)
-
-    Returns:
-        BField    : 1D ndarray of magnetic field values (centered at peak)
-        AbCut     : Cut absorption signal
-        DemodCut  : Cut demodulated signal
+    Notes
+    -----
+    * Segmentation is performed on the triangle/sawtooth only:
+      - 'half' uses longest monotonic runs (d(tri)/dt > 0 for rising, < 0 for falling),
+        robust to small noise via smoothing and minimal-length filtering.
+      - 'full' uses turning points (sign changes in derivative) to get peak-to-peak windows.
+    * The absorption signal is **not** used to define boundaries. It is only used by
+      `anchor='abspeak'` to pick where to start.
+    * If you need your entire B axis **strictly within** ±range after clipping, use
+      the default `map_mode='global'`.
     """
+    import numpy as np
+    import pandas as pd
+
+    # ---------- extract columns ----------
     if isinstance(data, pd.DataFrame):
-        t, Ab, demod = data.values.T
+        df = data.copy()
+        for c in [time_col, ab_col, demod_col]:
+            if c not in df.columns:
+                raise ValueError(f"DataFrame needs '{time_col}', '{ab_col}', '{demod_col}'.")
+        if tri_col not in df.columns:
+            if require_tri:
+                raise ValueError(f"Missing triangle column '{tri_col}'.")
+            else:
+                raise ValueError("Triangle waveform required for reliable cutting.")
+        t     = df[time_col].to_numpy()
+        Ab    = df[ab_col].to_numpy()
+        demod = df[demod_col].to_numpy()
+        tri   = df[tri_col].to_numpy()
     else:
-        t, Ab, demod = data.T
+        arr = np.asarray(data)
+        if arr.ndim < 2 or arr.shape[1] < 4:
+            raise ValueError("ndarray must be (N,4): [t, Ab, demod, tri].")
+        t, Ab, demod, tri = arr[:,0], arr[:,1], arr[:,2], arr[:,3]
 
+    B_min, B_max = B_range
     N = len(Ab)
-    center_idx = N // 2
-    center_left  = center_idx - N // 3
-    center_right = min(center_idx + N // 3, N - 1)
+    if N < 16:
+        raise ValueError("Not enough samples.")
 
-    # Smooth & pick peak
-    smooth_Ab = np.convolve(Ab, np.ones(10)/10, mode='same')
-    peak1 = center_left + np.argmax(smooth_Ab[center_left:center_right+1])
-    peak2 = center_left + np.argmax(Ab[center_left:center_right+1])
-    peak_idx = peak1 if Ab[peak1] > Ab[peak2] else peak2
+    def _smooth(x, w):
+        if w is None or w <= 1: return x
+        k = np.ones(int(w))/int(w)
+        return np.convolve(x, k, mode='same')
 
-    # Search valleys around peak
-    range_size = N // 3
-    left_r  = max(0, peak_idx - range_size)
-    right_r = min(N - 1, peak_idx + range_size)
+    def _edge_baseline(y, frac=0.1):
+        n = max(1, int(len(y)*frac))
+        return float(np.median(np.r_[y[:n], y[-n:]]))
 
-    left_idx  = left_r + np.argmin(Ab[left_r : peak_idx+1])
-    right_idx = peak_idx + np.argmin(Ab[peak_idx : right_r+1])
+    # ---------- build monotonic runs on the triangle ----------
+    tri_s = _smooth(tri, smooth_win)
+    dtri  = np.diff(tri_s)
 
-    # Cut and convert
-    TimeCut  = t[left_idx : right_idx+1]
-    AbCut    = Ab[left_idx : right_idx+1]
-    DemodCut = demod[left_idx : right_idx+1]
+    if direction == 'auto':
+        dir_mode = 'rising' if np.sum(dtri > 0) >= np.sum(dtri < 0) else 'falling'
+    else:
+        dir_mode = 'rising' if direction == 'rising' else 'falling'
 
-    stepB  = sweepB * sweepf * 4   # dB/dt in nT/s
-    BField = (TimeCut - t[peak_idx]) * stepB
+    good = (dtri > 0) if dir_mode == 'rising' else (dtri < 0)
+    edges = np.diff(np.r_[False, good, False])
+    starts = np.where(edges ==  1)[0]
+    ends   = np.where(edges == -1)[0]
+    runs = [(int(s), int(e)) for s, e in zip(starts, ends) if (e - s) >= 8]
+    if not runs:  # last resort
+        runs = [(0, N)]
 
+    # full cycles: merge rise+fall via turning points
+    if segment == 'full':
+        sign = np.sign(dtri)
+        tps = 1 + np.where(sign[:-1] * sign[1:] < 0)[0]  # turning points
+        if len(tps) >= 2:
+            cand = [(int(tps[i]), int(tps[i+1])) for i in range(len(tps)-1)]
+            runs = [rc for rc in cand if (rc[1]-rc[0]) >= 8]
+
+    # ---------- choose anchor run ----------
+    if anchor == 'first':
+        run0 = 0
+    elif anchor == 'last':
+        run0 = len(runs) - 1
+    elif anchor == 'center':
+        mid = N // 2
+        run0 = int(np.argmin([abs((s+e)//2 - mid) for s, e in runs]))
+    else:  # 'abspeak'
+        c0 = _edge_baseline(Ab)
+        idx_peak = int(np.argmax(np.abs(Ab - c0)))
+        run0 = 0
+        for i, (s, e) in enumerate(runs):
+            if s <= idx_peak < e:
+                run0 = i
+                break
+
+    # ---------- stitch requested number of runs ----------
+    run1 = min(len(runs), run0 + int(cycles))
+    s_full, e_full = runs[run0][0], runs[run1-1][1]
+
+    # Record full (pre-clip) triangle span for 'global' mapping
+    tri_full = tri[s_full:e_full]
+    tr_min_full = float(np.min(tri_full))
+    tr_max_full = float(np.max(tri_full))
+
+    # edge clipping to avoid artefacts near boundaries
+    clip = int(max(0.0, float(edge_clip_frac)) * (e_full - s_full))
+    s0 = min(max(0, s_full + clip), e_full - 1)
+    e0 = max(min(N, e_full - clip), s0 + 1)
+
+    tri_cut   = tri[s0:e0]
+    AbCut     = Ab[s0:e0]
+    DemodCut  = demod[s0:e0]
+
+    # ---------- map triangle -> B ----------
+    if map_mode == 'global':
+        # Use pre-clip extrema: clipping does NOT stretch back to ±range
+        tr_lo, tr_hi = tr_min_full, tr_max_full
+    else:  # 'local' (stretches the clipped segment to full range)
+        tr_lo, tr_hi = float(np.min(tri_cut)), float(np.max(tri_cut))
+
+    if not np.isfinite(tr_lo) or not np.isfinite(tr_hi) or tr_hi <= tr_lo:
+        BField = np.full_like(tri_cut, (B_min + B_max)/2.0, dtype=float)
+    else:
+        scale  = (B_max - B_min) / (tr_hi - tr_lo + 1e-30)
+        BField = B_min + (tri_cut - tr_lo) * scale
+        lo, hi = (B_min, B_max) if B_min <= B_max else (B_max, B_min)
+        BField = np.clip(BField, lo, hi)  # numeric safety
+
+    if return_debug:
+        dbg = dict(
+            direction=dir_mode,
+            runs=runs,
+            chosen_full=(s_full, e_full),
+            chosen_clipped=(s0, e0),
+            tri_span_full=(tr_min_full, tr_max_full),
+            tri_span_local=(float(np.min(tri_cut)) if len(tri_cut) else np.nan,
+                            float(np.max(tri_cut)) if len(tri_cut) else np.nan),
+            map_mode=map_mode
+        )
+        return BField, AbCut, DemodCut, dbg
     return BField, AbCut, DemodCut
+
 
 
 
