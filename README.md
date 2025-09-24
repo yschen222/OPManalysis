@@ -30,7 +30,7 @@ pip install git+https://github.com/yschen222/OPManalysis .
 > You can now import the package with:
 >
 > ```python
-> from opmanalysis import lorentz_fit, one_cycle_cut, noise_psd, ...
+> from opmantool import lorentz_fit, one_cycle_cut, noise_psd, ...
 > ```
 
 ---
