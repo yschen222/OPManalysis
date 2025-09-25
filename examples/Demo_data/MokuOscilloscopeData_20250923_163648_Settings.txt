@@ -1,0 +1,11 @@
+% Saved 2025-09-23 T 16:36:48 +0800
+Moku:Pro Oscilloscope
+Channel A
+Channel B
+Channel C
+Channel D
+Time span 2.788 s, time offset -92.92 ms, Precision acquisition mode, no averaging
+Edge trigger: Channel D, level 4.593 mV, Normal mode, Rising edge, Auto sensitivity, noise reject off, HF reject off
+Output A (off) - Ramp, 200.000 mHz, 22.0 mVpp, offset 5.1 mV, phase 0.000 000 deg, symmetry 50.00 %
+Output B (off) - DC, 1.5 mV
+Internal 10 MHz clock

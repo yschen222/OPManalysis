@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
 from scipy.stats import linregress
+from lmfit import Model
 from lmfit.models import GaussianModel, ConstantModel, VoigtModel
 from scipy.special import wofz
 
@@ -37,22 +38,80 @@ def _baseline_linear_edges(x, y, frac=0.15):
 
 def _refine_center_quadratic(x, y_corr, guess_idx, win=3):
     """
-    Refine the peak center by fitting a local quadratic (2*win+1 points)
-    around the extremum on baseline-corrected data y_corr.
-    Returns the vertex location if it lies inside the local window.
+    Refine the resonance center near `guess_idx` by a local quadratic fit.
+
+    Strategy
+    --------
+    1) Take a small window [guess_idx-win, guess_idx+win] around the provisional center.
+    2) Guard against ill-conditioned fits (too few points, tiny dynamic range).
+       If the window is not suitable, fall back to a 3-point parabolic vertex
+       using (idx-1, idx, idx+1). If even that is unavailable, return x[guess_idx].
+    3) Standardize X before quadratic fit to improve conditioning.
+    4) Compute the vertex x* = -b/(2a) and map it back to the original scale.
+       If the vertex lies outside the local window, return x[guess_idx].
+
+    Parameters
+    ----------
+    x : array-like
+        Field axis (1D).
+    y_corr : array-like
+        Baseline-corrected signal (1D), aligned with `x`.
+    guess_idx : int
+        Index of the provisional center (e.g., max |y_corr|).
+    win : int, optional
+        Half-window size for the local quadratic fit (default: 3).
+
+    Returns
+    -------
+    float
+        Refined center position in the same units as `x`.
     """
+    import numpy as np, warnings
+
     i0 = max(0, guess_idx - win)
     i1 = min(len(x), guess_idx + win + 1)
-    X = x[i0:i1]; Y = y_corr[i0:i1]
-    if len(X) < 3:
+    X = np.asarray(x[i0:i1], dtype=float)
+    Y = np.asarray(y_corr[i0:i1], dtype=float)
+
+    # Guard: insufficient points or negligible dynamic range
+    if (len(X) < 3) or (np.ptp(X) < 1e-12) or (np.ptp(Y) < 10*np.finfo(float).eps):
+        # 3-point parabolic fallback around guess_idx (if available)
+        if 1 <= guess_idx < len(x) - 1:
+            x1, x2, x3 = float(x[guess_idx-1]), float(x[guess_idx]), float(x[guess_idx+1])
+            y1, y2, y3 = float(y_corr[guess_idx-1]), float(y_corr[guess_idx]), float(y_corr[guess_idx+1])
+            denom = (y1 - 2.0*y2 + y3)
+            if abs(denom) > 1e-20:
+                # Vertex of a parabola through three equally spaced points
+                dx = (x3 - x1) / 2.0
+                xc = x2 + 0.5*(y1 - y3)/denom * dx
+                # Clamp to neighbors for safety
+                return float(min(max(xc, min(x1, x3)), max(x1, x3)))
         return float(x[guess_idx])
-    a, b, c = np.polyfit(X, Y, 2)
+
+    # Standardize X to improve conditioning
+    xm, xs = X.mean(), X.std()
+    if xs < 1e-20:
+        return float(x[guess_idx])
+    Xn = (X - xm) / xs
+
+    # Suppress RankWarning from poorly conditioned polyfits
+    with warnings.catch_warnings():
+        from numpy import RankWarning
+        warnings.simplefilter("ignore", RankWarning)
+        a, b, c = np.polyfit(Xn, Y, 2)
+
     if abs(a) < 1e-20:
         return float(x[guess_idx])
-    xc = -b/(2*a)
-    if xc < X.min() or xc > X.max():
+
+    # Vertex in normalized space, then map back
+    xc_n = -b / (2.0*a)
+    xc = xc_n * xs + xm
+
+    # If vertex falls outside the local window, keep original guess
+    if (xc < X.min()) or (xc > X.max()):
         return float(x[guess_idx])
     return float(xc)
+
 
 def _halfmax_width(x, y, baseline):
     """
@@ -568,17 +627,20 @@ def asymmetric_lorentz_fit(data, p0=None, bounds=None):
 Fitting tools of the OPM signals after lock-in amplifier: Dispersion Lorentz, Linear region
 """
 
-def dispersion_lorentz_fit(data, p0=None, bounds=None, max_rel_err=0.01):
+def dispersion_lorentz_fit(
+    data, p0=None, bounds=None, max_rel_err=0.01,
+    center_hint=None, smooth_win=9, robust_iters=1, mad_thresh=4.0
+):
     """
     Dispersive Lorentzian with center shift (lock-in demod line shape).
 
-      f(B) = a * b * (B - center) / (1 + (b*(B - center))^2) + c
+        f(B) = a * b * (B - center) / (1 + (b*(B - center))^2) + c
 
     Notes
     -----
-    - Valid in the low-field / small-signal regime near B ≈ center.
+    - Valid near resonance (low-field / small-signal regime).
     - Slope at B ≈ center is a*b.
-    - The underlying Lorentz HWHM (gamma) is 1/|b|, so FWHM = 2/|b|.
+    - Underlying Lorentz HWHM (gamma) is 1/|b|, hence FWHM = 2/|b|.
 
     Parameters
     ----------
@@ -587,34 +649,45 @@ def dispersion_lorentz_fit(data, p0=None, bounds=None, max_rel_err=0.01):
           - ('x','y') or
           - ('B','S') or
           - ('Ab','demod')
-        The function internally maps to columns 'x' (field) and 'y' (signal).
-    p0 : None | tuple/list | dict
-        Initial guess (optional).
+        Internally mapped to 'x' (field) and 'y' (signal).
+    p0 : None | tuple/list | dict, optional
+        Initial guess.
         - None: auto-estimated.
         - tuple/list:
             * legacy (a, b, c)  -> center=0 assumed
             * new    (a, b, center, c)
-        - dict: {'amplitude','b'|'gamma'|'FWHM','center','offset'}
-    bounds : dict | None
-        Optional bounds for the same dict keys above.
-    max_rel_err : float
-        |(b*(B-center))^2| < max_rel_err defines a suggested linear range.
+        - dict: {'amplitude', 'b'|'gamma'|'FWHM', 'center', 'offset'}
+    bounds : dict | None, optional
+        Optional bounds for the same keys as above.
+    max_rel_err : float, optional
+        Small-signal criterion |(b*(B-center))^2| < max_rel_err used to report LinearRange.
+    center_hint : float or None, optional
+        If given, the zero-crossing closest to this value is preferred as the seed center.
+    smooth_win : int, optional
+        Moving-average window (samples) used only for seed estimation. Disable with <=1.
+    robust_iters : int, optional
+        Number of robust re-fits with MAD outlier rejection (0/1/2 ...).
+    mad_thresh : float, optional
+        Threshold in units of robust sigma (1.4826*MAD) for outlier rejection.
 
     Returns
     -------
-    dict with keys (aligned with other fitters):
-        out        : lmfit ModelResult
-        S_fit      : best-fit y
-        Params     : {'amplitude','center','b','gamma','offset','slope'}
-        FWHM       : 2/|b|
-        sigma      : None
-        gamma      : 1/|b|
-        Data       : DataFrame with columns x,y,S_fit
-        R2         : coefficient of determination
-        Slope      : a*b at B≈center
-        LinearRange: (Bmin, Bmax) where |(b*(B-center))^2| < max_rel_err
+    dict
+        {
+          'out'        : lmfit ModelResult,
+          'S_fit'      : fitted y on the input grid,
+          'Params'     : {'amplitude','center','b','gamma','offset','slope'},
+          'FWHM'       : 2/|b|,
+          'sigma'      : None,
+          'gamma'      : 1/|b|,
+          'Data'       : input DataFrame with S_fit column,
+          'R2'         : coefficient of determination,
+          'Slope'      : a*b  (first-order slope at center),
+          'LinearRange': (Bmin, Bmax) for the given max_rel_err,
+          'FitResult'  : callable f(B)
+        }
     """
-    # -------- normalize input columns -> 'x','y' --------
+    # ---------- normalize input ----------
     if isinstance(data, np.ndarray):
         if data.ndim != 2 or data.shape[1] < 2:
             raise ValueError("numpy array must be N×2")
@@ -629,68 +702,119 @@ def dispersion_lorentz_fit(data, p0=None, bounds=None, max_rel_err=0.01):
         elif {'Ab','demod'}.issubset(cols):
             df = df.rename(columns={'Ab':'x','demod':'y'})
         else:
-            # try fallback to first two columns
             if df.shape[1] >= 2:
-                df = df.iloc[:, :2]
-                df.columns = ['x','y']
+                df = df.iloc[:, :2]; df.columns = ['x','y']
             else:
                 raise ValueError("data must contain ('x','y') or ('B','S') or ('Ab','demod')")
-    x = df['x'].values
-    y = df['y'].values
 
-    # -------- model --------
+    x_full = df['x'].to_numpy(float)
+    y_full = df['y'].to_numpy(float)
+
+    # ---------- model ----------
     def f(B, a, b, center, c):
         u = b*(B - center)
         return a * b * (B - center) / (1.0 + u*u) + c
-
     model = Model(f)
 
-    # -------- auto seeds --------
-    # remove linear baseline for robust center/width/amplitude estimation
-    c0_lin, c1_lin = _baseline_linear_edges(x, y, frac=0.15)
-    y_lin = y - (c0_lin + c1_lin*x)
+    # ---------- helpers ----------
+    def _edge_baseline(y, frac=0.1):
+        n = max(1, int(len(y)*frac))
+        return float(np.median(np.r_[y[:n], y[-n:]]))
 
-    # 1) zero-crossing as initial center
-    sign = np.sign(y_lin)
-    cross_idx = np.where(sign[:-1]*sign[1:] <= 0)[0]
-    if len(cross_idx) > 0:
-        # choose crossing with largest local slope
-        dy = np.gradient(y_lin, x)
-        cand = []
-        for i in cross_idx:
-            # linear interpolation zero
-            xz = x[i] - y_lin[i]*(x[i+1]-x[i])/(y_lin[i+1]-y_lin[i] + 1e-30)
-            slope_local = abs(dy[i] if abs(dy[i]) > abs(dy[min(i+1, len(dy)-1)]) else dy[min(i+1, len(dy)-1)])
-            cand.append((slope_local, xz))
-        center0 = float(sorted(cand, key=lambda t: -abs(t[0]))[0][1])
+    def _baseline_linear_edges(x, y, frac=0.15):
+        n = max(3, int(len(x)*frac))
+        X = np.r_[x[:n], x[-n:]]
+        Y = np.r_[y[:n], y[-n:]]
+        if len(X) < 3:
+            return float(np.median(Y)), 0.0
+        b1, b0 = np.polyfit(X, Y, 1)  # y = b1*x + b0
+        return float(b0), float(b1)
+
+    def _movavg(v, w):
+        if w is None or w <= 1: return v
+        k = np.ones(int(w))/int(w)
+        return np.convolve(v, k, mode='same')
+
+    # ---------- seeds on a deduped, increasing, smoothed grid ----------
+    c0_lin, c1_lin = _baseline_linear_edges(x_full, y_full, frac=0.15)
+    y_lin = y_full - (c0_lin + c1_lin*x_full)
+
+    # unique & increasing for seed estimation
+    xu_all, iu_all = np.unique(x_full, return_index=True)
+    yu_all = y_lin[iu_all]
+    yu_all = _movavg(yu_all, smooth_win)
+
+    # ignore edges (turn-around / noise)
+    M = len(xu_all)
+    if M >= 20:
+        i0 = int(0.05*M); i1 = int(0.95*M)
     else:
-        # fallback: minimum |y_lin|
-        center0 = float(x[np.argmin(np.abs(y_lin))])
+        i0, i1 = 0, M
+    xu = xu_all[i0:i1]; yu = yu_all[i0:i1]
+    if len(xu) < 4 or np.ptp(xu) <= 0:
+        xu, yu = xu_all, yu_all
 
-    # 2) extrema to estimate width b and amplitude a
-    i_max = int(np.argmax(y_lin))
-    i_min = int(np.argmin(y_lin))
-    x_max, x_min = float(x[i_max]), float(x[i_min])
-    # distance from center to the two extrema (take average magnitude)
-    dL = abs(x_min - center0)
-    dR = abs(x_max - center0)
-    d = np.nanmean([dL, dR]) if np.isfinite(dL) and np.isfinite(dR) else max(dL, dR)
-    if not np.isfinite(d) or d <= 0:
-        span = (x.max()-x.min()) if x.max()>x.min() else 1.0
-        d = span/10.0
-    b0 = 1.0/max(1e-12, d)  # for f(x) = a*b*x/(1+(b*x)^2), extrema at |x|=1/|b|
-    # at extrema, |f| ≈ |a|/2  (after linear baseline removal)
-    a0 = 2.0*max(abs(y_lin[i_max]), abs(y_lin[i_min]))
-    # constant offset from edges (keep constant baseline in the model)
-    c0 = _edge_baseline(y)
+    # slope by finite difference (no gradient)
+    dx = np.diff(xu)
+    valid = dx > 0
+    if not np.all(valid):
+        mask = np.r_[True, valid]
+        xu = xu[mask]; yu = yu[mask]; dx = np.diff(xu)
+    dydx = np.diff(yu) / np.where(np.abs(dx) < 1e-30, 1e-30, dx)
 
-    # -------- p0 handling --------
+    # zero crossings on smoothed signal
+    sgn = np.sign(yu)
+    zc = np.where(sgn[:-1]*sgn[1:] <= 0)[0]  # crossing in [k,k+1]
+
+    # pick center0
+    if len(zc):
+        if center_hint is not None and np.isfinite(center_hint):
+            # crossing closest to hint
+            zc_pos = xu[zc] - yu[zc]*(xu[zc+1]-xu[zc])/(yu[zc+1]-yu[zc] + 1e-15)
+            center0 = float(zc_pos[np.argmin(np.abs(zc_pos - center_hint))])
+        else:
+            # crossing nearest to the location of max |dS/dB|
+            i_dmax = int(np.argmax(np.abs(dydx)))
+            k = int(zc[np.argmin(np.abs(zc - i_dmax))])
+            x1,x2,y1,y2 = xu[k], xu[k+1], yu[k], yu[k+1]
+            center0 = x1 + (-y1)*(x2 - x1)/(y2 - y1 + 1e-15)
+    else:
+        center0 = float(xu[np.argmin(np.abs(yu))])
+
+    # extrema around center0
+    sgd = np.sign(dydx)
+    tp = np.where(sgd[:-1]*sgd[1:] <= 0)[0]
+    tp_x = (xu[tp] + xu[tp+1]) * 0.5 if len(tp) else np.array([])
+    if len(tp_x):
+        left_mask  = tp_x <  center0
+        right_mask = tp_x >= center0
+        if np.any(left_mask) and np.any(right_mask):
+            xl = tp_x[left_mask][-1]
+            xr = tp_x[right_mask][0]
+            sep = abs(xr - xl)                    # ~ 2/gamma
+            gamma0 = max(1e-6, sep/2.0)
+            b0 = 1.0 / gamma0
+            il = int(np.argmin(np.abs(xu - xl)))
+            ir = int(np.argmin(np.abs(xu - xr)))
+            a0 = 2.0 * max(abs(yu[il]), abs(yu[ir]))  # |y_ext| ~ |a|/2
+        else:
+            span = max(1e-9, xu.max() - xu.min())
+            b0 = 4.0 / span
+            a0 = 2.0 * np.max(np.abs(yu))
+    else:
+        span = max(1e-9, xu.max() - xu.min())
+        b0 = 4.0 / span
+        a0 = 2.0 * np.max(np.abs(yu))
+
+    c0 = _edge_baseline(y_full)
+
+    # ---------- p0 handling ----------
     if p0 is None:
         seeds = dict(amplitude=a0, b=b0, center=center0, offset=c0)
     elif isinstance(p0, (list, tuple)):
-        if len(p0) == 3:  # legacy (a, b, c)
+        if len(p0) == 3:
             seeds = dict(amplitude=p0[0], b=p0[1], center=0.0, offset=p0[2])
-        elif len(p0) == 4:  # (a, b, center, c)
+        elif len(p0) == 4:
             seeds = dict(amplitude=p0[0], b=p0[1], center=p0[2], offset=p0[3])
         else:
             raise ValueError("p0 must be (a,b,c) or (a,b,center,c)")
@@ -699,11 +823,10 @@ def dispersion_lorentz_fit(data, p0=None, bounds=None, max_rel_err=0.01):
                      b=p0.get('b', b0),
                      center=p0.get('center', center0),
                      offset=p0.get('offset', c0))
-        # allow gamma/FWHM instead of b
         if 'gamma' in p0 and p0['gamma'] not in (None, np.nan):
-            seeds['b'] = 1.0/max(1e-12, abs(p0['gamma']))
+            seeds['b'] = 1.0 / max(1e-12, abs(p0['gamma']))
         if 'FWHM' in p0 and p0['FWHM'] not in (None, np.nan):
-            seeds['b'] = 2.0/max(1e-12, abs(p0['FWHM']))
+            seeds['b'] = 2.0 / max(1e-12, abs(p0['FWHM']))
     else:
         raise ValueError("p0 must be None, tuple/list or dict")
 
@@ -712,7 +835,7 @@ def dispersion_lorentz_fit(data, p0=None, bounds=None, max_rel_err=0.01):
                              center=seeds['center'],
                              c=seeds['offset'])
 
-    # -------- bounds (dict style like other fitters) --------
+    # ---------- bounds ----------
     if isinstance(bounds, dict):
         if 'amplitude' in bounds:
             lo, hi = bounds['amplitude']; pars['a'].set(min=lo, max=hi)
@@ -723,7 +846,6 @@ def dispersion_lorentz_fit(data, p0=None, bounds=None, max_rel_err=0.01):
         if 'b' in bounds:
             lo, hi = bounds['b'];        pars['b'].set(min=lo, max=hi)
         else:
-            # infer symmetric bounds on b from gamma/FWHM if provided
             b_lo_mag, b_hi_mag = 0.0, np.inf
             if 'gamma' in bounds:
                 glo, ghi = bounds['gamma']
@@ -736,108 +858,70 @@ def dispersion_lorentz_fit(data, p0=None, bounds=None, max_rel_err=0.01):
             if np.isfinite(b_hi_mag):
                 pars['b'].set(min=-b_hi_mag, max=b_hi_mag)
 
-    # -------- fit --------
-    out = model.fit(y, pars, B=x)
-    yfit = out.best_fit
+    # ---------- robust fit (optional) ----------
+    mask = np.ones_like(x_full, dtype=bool)
+    out = None
+    for it in range(max(1, int(robust_iters)+1)):
+        out = model.fit(y_full[mask], pars, B=x_full[mask])
+        a  = out.params['a'].value
+        b  = out.params['b'].value
+        c0p= out.params['c'].value
+        ctr= out.params['center'].value
 
-    a     = out.params['a'].value
-    b     = out.params['b'].value
-    center= out.params['center'].value
-    c     = out.params['c'].value
+        if it >= robust_iters:
+            break
+        # MAD-based outlier rejection on residuals of current fit
+        y_pred = f(x_full[mask], a, b, ctr, c0p)
+        resid  = y_full[mask] - y_pred
+        med    = np.median(resid)
+        mad    = np.median(np.abs(resid - med))
+        sigma  = 1.4826 * mad if mad > 0 else np.std(resid)
+        if sigma <= 0:
+            break
+        keep = np.abs(resid - med) <= mad_thresh * sigma
+        # rebuild mask on the full grid
+        new_mask = np.zeros_like(mask, dtype=bool)
+        new_mask[np.where(mask)[0][keep]] = True
+        # if almost nothing changes, stop
+        if new_mask.sum() < max(12, 0.2*len(x_full)) or np.array_equal(new_mask, mask):
+            break
+        mask = new_mask
 
-    # width proxies consistent with other models
+    # predict on full grid to fill Data['S_fit'] with correct length
+    a      = out.params['a'].value
+    b      = out.params['b'].value
+    center = out.params['center'].value
+    coff   = out.params['c'].value
+    yfit_full = f(x_full, a, b, center, coff)
+
     FWHM  = 2.0/abs(b) if b != 0 else np.inf
-    gamma = 1.0/abs(b) if b != 0 else np.inf  # HWHM of underlying Lorentz
-
-    # slope and linear range near center
+    gamma = 1.0/abs(b) if b != 0 else np.inf
     slope = a * b
     B_half = np.sqrt(max_rel_err) / max(1e-12, abs(b))
     linear_range = (center - B_half, center + B_half)
 
-    # R^2
-    r2 = _r2(y, yfit)
+    ss_res = float(np.sum((y_full - yfit_full)**2))
+    ss_tot = float(np.sum((y_full - np.mean(y_full))**2))
+    r2 = 1.0 - ss_res/ss_tot if ss_tot > 0 else np.nan
 
     return {
         "out": out,
-        "S_fit": yfit,
+        "S_fit": yfit_full,
         "Params": {
             "amplitude": a,
             "center": center,
             "b": b,
             "gamma": gamma,
-            "offset": c,
+            "offset": coff,
             "slope": slope
         },
         "FWHM": FWHM,
+        "sigma": None,
         "gamma": gamma,
-        "Data": df.assign(S_fit=yfit),
+        "Data": df.assign(S_fit=yfit_full),
         "R2": r2,
         "Slope": slope,
-        "LinearRange": linear_range
-    }
-
-
-
-def linear_region_fit(data, win=10, r2min=0.95):
-    """
-    Automatically find the strongest linear region in B vs. S data using sliding window and R² threshold.
-
-    Parameters:
-        data : DataFrame or ndarray
-            Must include columns 'B' (x-axis) and 'S' (y-axis signal, e.g., demodulated response)
-
-        win : int, default=10
-            Initial window size to compute seed slopes
-
-        r2min : float, default=0.95
-            Minimum R² to allow linear region expansion
-
-    Returns:
-        result : dict {
-            'Region'   : DataFrame containing the linear subset of data,
-            'Slope'    : slope of best-fit line in the linear region,
-            'R2'       : coefficient of determination for that region,
-            'FitResult': callable linear function: f(x) = slope * x + intercept
-        }
-    """
-    if isinstance(data, np.ndarray):
-        data = pd.DataFrame(data, columns=['B', 'S'])
-    else:
-        data = data.rename(columns=lambda c: {'B': 'B', 'demod': 'S'}.get(c, c))
-    data = data.sort_values('B').reset_index(drop=True)
-
-    B, S = data['B'].values, data['S'].values
-    n = len(B)
-
-    slopes = []
-    for i in range(n - win + 1):
-        seg = slice(i, i + win)
-        res = linregress(B[seg], S[seg])
-        slopes.append(res.slope)
-    slopes = np.array(slopes)
-
-    best = np.argmax(np.abs(slopes))
-    left, right = best, best + win - 1
-
-    while left > 0:
-        res = linregress(B[left - 1 : right + 1], S[left - 1 : right + 1])
-        if res.rvalue ** 2 < r2min:
-            break
-        left -= 1
-
-    while right < n - 1:
-        res = linregress(B[left : right + 2], S[left : right + 2])
-        if res.rvalue ** 2 < r2min:
-            break
-        right += 1
-
-    res = linregress(B[left : right + 1], S[left : right + 1])
-    region = data.iloc[left : right + 1]
-
-    return {
-        "Region": region,
-        "Slope": res.slope,
-        "R2": res.rvalue ** 2,
-        "FitResult": lambda x: res.intercept + res.slope * x
+        "LinearRange": linear_range,
+        "FitResult": (lambda B: f(B, a, b, center, coff)),
     }
 

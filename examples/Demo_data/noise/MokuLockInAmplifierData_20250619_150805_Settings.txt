@@ -1,9 +1,0 @@
-% Saved 2025-06-19 T 15:08:05 +0800
-Moku:Pro Lock-In Amplifier
-Input A
-Input B
-Internal demodulation: 997.000 000 Hz, 174.000 000 deg
-Lowpass filter corner frequency 100 Hz (time constant 1.59 ms), slope 24 dB / octave
-Output A - I signal, +40.0 dB gain, invert off, offset 0.000 0 V, 0 dB output gain, output disabled
-Output B - Demodulation signal, amplitude 11 mVpp, offset 0.000 0 V, 0 dB output gain, output enabled
-Internal 10 MHz clock

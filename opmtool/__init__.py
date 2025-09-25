@@ -10,11 +10,11 @@ from .fittingtool import (
     gauss_fit,
     voigt_fit,
     asymmetric_lorentz_fit,
-    dispersion_lorentz_fit,
-    linear_region_fit
+    dispersion_lorentz_fit
 )
 
 from .dataprocess import (
     one_cycle_cut,
-    noise_psd
+    noise_psd, 
+    noise_psd_lowband
 )

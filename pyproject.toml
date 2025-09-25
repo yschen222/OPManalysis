@@ -1,22 +1,41 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "OPManalysis"
 version = "0.1.0"
 description = "Fitting and preprocessing tools for optically pumped magnetometers"
-authors = [{ name = "Yi-Hsuan Chen", email = "yschen222@gmail.com" }]
 readme = "README.md"
+authors = [{ name = "Yi-Hsuan Chen", email = "yschen222@gmail.com" }]
 license = { text = "MIT" }
+requires-python = ">=3.10"
+
 dependencies = [
-    "numpy",
-    "pandas",
-    "scipy",
-    "matplotlib",
-    "lmfit"
+  "numpy",
+  "pandas",
+  "scipy",
+  "matplotlib",
+  "lmfit",
+  "openpyxl"  
 ]
-requires-python = ">=3.8"
+
+
+[project.optional-dependencies]
+notify = [
+  "plyer",                        
+  "win10toast; platform_system=='Windows'"  
+]
+
+dev = [
+  "rich",
+  "tabulate",
+  "mypy",
+  "ruff"
+]
+
+
 
 [tool.setuptools]
-packages = ["opmtool"]
+
+packages = ["opmtool", "opm_batch", "labutils"]
