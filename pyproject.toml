@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "OPManalysis"
-version = "0.1.0"
+version = "1.1.0"
 description = "Fitting and preprocessing tools for optically pumped magnetometers"
 readme = "README.md"
 authors = [{ name = "Yi-Hsuan Chen", email = "yschen222@gmail.com" }]
