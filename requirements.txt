@@ -1,0 +1,5 @@
+numpy>=1.22,<2.0
+scipy>=1.9,<2.0
+pandas>=1.5,<3.0
+matplotlib>=3.5,<4.0
+lmfit>=1.1,<2.0
