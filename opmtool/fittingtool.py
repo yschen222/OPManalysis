@@ -13,6 +13,14 @@ from scipy.stats import linregress
 from lmfit import Model
 from lmfit.models import GaussianModel, ConstantModel, VoigtModel
 from scipy.special import wofz
+import warnings 
+try:
+    # NumPy 2.x
+    from numpy.exceptions import RankWarning
+except Exception:
+    # NumPy 1.x
+    from numpy import RankWarning
+
 
 # =========================
 # Helpers
@@ -33,7 +41,9 @@ def _baseline_linear_edges(x, y, frac=0.15):
     Y = np.r_[y[:n], y[-n:]]
     if len(X) < 3:
         return float(np.median(Y)), 0.0
-    b1, b0 = np.polyfit(X, Y, 1)  # y = b1*x + b0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RankWarning)  # 1.x/2.x 皆可
+        b1, b0 = np.polyfit(X, Y, 1)  # y = b1*x + b0
     return float(b0), float(b1)
 
 def _refine_center_quadratic(x, y_corr, guess_idx, win=3):
@@ -66,7 +76,6 @@ def _refine_center_quadratic(x, y_corr, guess_idx, win=3):
     float
         Refined center position in the same units as `x`.
     """
-    import numpy as np, warnings
 
     i0 = max(0, guess_idx - win)
     i1 = min(len(x), guess_idx + win + 1)
@@ -96,7 +105,6 @@ def _refine_center_quadratic(x, y_corr, guess_idx, win=3):
 
     # Suppress RankWarning from poorly conditioned polyfits
     with warnings.catch_warnings():
-        from numpy import RankWarning
         warnings.simplefilter("ignore", RankWarning)
         a, b, c = np.polyfit(Xn, Y, 2)
 
