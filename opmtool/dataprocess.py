@@ -14,10 +14,6 @@ from scipy.signal import welch, find_peaks
 """
 Initial data processing
 """
-
-"""
-Initial data processing
-"""
 def one_cycle_cut(
     data,
     B_range,
@@ -295,7 +291,6 @@ def one_cycle_cut(
         )
         return BField, AbCut, DemodCut, dbg
     return BField, AbCut, DemodCut
-
 
 
 
