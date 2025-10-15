@@ -15,6 +15,9 @@ from scipy.signal import welch
 Initial data processing
 """
 
+"""
+Initial data processing
+"""
 def one_cycle_cut(
     data,
     B_range,
@@ -28,114 +31,112 @@ def one_cycle_cut(
     smooth_win=5,                  # smoothing window (samples) for the triangle
     anchor='abspeak',              # 'abspeak' | 'center' | 'first' | 'last'
     edge_clip_frac=0.02,           # clip 2% from both ends of the chosen segment(s)
-    map_mode='global',             # 'global' (default) | 'local'  ← see docstring
+    map_mode='global',             # 'global' (default) | 'local'
     require_tri=True,
     return_debug=False
 ):
     """
-    Cut one or more sweep segments **using the measured triangle/sawtooth waveform only**
-    and convert the selected segment(s) to magnetic field values according to the given
-    (B_min, B_max).
+    Cut **exactly one sweep segment** from a measured triangle/sawtooth waveform
+    and convert it into a magnetic-field axis according to the given (B_min, B_max).
 
-    This function is designed for OPM scans where each record often contains only a
-    rising ramp or only a falling ramp (i.e., sawtooth). Segmentation relies solely
-    on the triangle/sawtooth monotonic runs; the absorption signal is used only to
-    choose an anchor segment when requested, and never to decide the boundaries.
+    This version uses *robust peak/trough detection* to find the most reliable
+    half- or full-cycle. It prevents duplicated or stitched segments and ensures
+    only one continuous sweep is extracted.
 
     Parameters
     ----------
     data : pandas.DataFrame or ndarray
         - DataFrame must include columns: [time_col, ab_col, demod_col, tri_col].
-        - ndarray must be shape (N,4): [t, Ab, demod, tri].
+        - ndarray must be shape (N, 4): [t, Ab, demod, tri].
     B_range : (float, float)
         (B_min, B_max) corresponding to the triangle extrema for *one sweep*.
-        Units are arbitrary but must match your intended nT scale.
+        Units are arbitrary but should match your intended nT scale.
     cycles : int, optional
-        Number of consecutive segments to cut.
-        * For segment='half', this is the number of half-cycles (rising-only or falling-only).
-        * For segment='full', each cycle contains one rising + one falling run.
-    segment : {'half','full'}, optional
-        - 'half': cut strictly monotonic runs (min→max rising, or max→min falling).
-        - 'full': cut peak-to-peak windows (rise+fall), detected by turning points.
-    direction : {'auto','rising','falling'}, optional
-        Which half to select when segment='half'.
-        - 'auto' infers from the derivative sign distribution of the triangle.
+        (Reserved for backward compatibility; ignored in this version.)
+        Always returns only one sweep segment.
+    segment : {'half', 'full'}, optional
+        - 'half': cut one strictly monotonic run (rising or falling).
+        - 'full': cut one complete peak-to-peak window (rise + fall).
+    direction : {'auto', 'rising', 'falling'}, optional
+        Which direction to select when `segment='half'`.
+        - 'auto' infers the dominant direction from the derivative sign of the triangle.
     time_col, ab_col, demod_col, tri_col : str
         Column names (used only when `data` is a DataFrame).
     smooth_win : int, optional
-        Moving-average window (in samples) for the triangle to make segmentation robust.
-        Set <=1 to disable smoothing.
-    anchor : {'abspeak','center','first','last'}, optional
-        Which segment to start from before stitching `cycles` consecutive segments:
-        - 'abspeak': the segment containing max |Ab - baseline| (baseline from edges).
-        - 'center' : the segment near the middle of the record.
-        - 'first'  : the earliest valid segment.
-        - 'last'   : the latest valid segment.
+        Moving-average window (in samples) applied to the triangle before
+        segmentation. Set ≤1 to disable smoothing.
+    anchor : {'abspeak', 'center', 'first', 'last'}, optional
+        Rule for choosing which detected segment to keep:
+        - 'abspeak': segment containing the largest |Ab - baseline|.
+        - 'center' : segment closest to the middle of the record.
+        - 'first'  : earliest valid segment.
+        - 'last'   : latest valid segment.
     edge_clip_frac : float, optional
-        Fraction of samples to drop from each end of the chosen segment(s) to avoid
-        turn-around artifacts and coil dynamics (e.g., 0.02 = 2%).
-    map_mode : {'global','local'}, optional
-        How to map triangle values to B after edge clipping:
-        - 'global' (recommended, default): use the **pre-clip** min/max of the chosen
-          segment(s) to map to (B_min, B_max). This means after clipping 2% the resulting
-          `BField` will **not** be stretched back to ±range; it naturally stays *within*
-          your requested range (e.g., ±34 nT).
-        - 'local': use the **post-clip** min/max to map to (B_min, B_max).
-          This stretches the clipped segment back to full range (typically *not* what you want).
+        Fraction of samples to remove from both ends of the chosen segment
+        to suppress turn-around artifacts and coil transients
+        (e.g. 0.02 = trim 2% at each end).
+    map_mode : {'global', 'local'}, optional
+        Defines how the triangle waveform is mapped to (B_min, B_max):
+        - 'global' (default): use the **pre-clipped** min/max of the chosen segment.
+          The resulting field naturally stays within your commanded ±range.
+        - 'local': rescale the **post-clipped** segment back to (B_min, B_max),
+          effectively stretching it to full range.
     require_tri : bool, optional
-        If True, raise if triangle column is missing (recommended).
+        If True, raises an error if the triangle column is missing.
     return_debug : bool, optional
-        If True, also return a debug dict with segmentation details.
+        If True, also returns a dictionary with segmentation diagnostics.
 
     Returns
     -------
     BField : ndarray
-        Magnetic field axis mapped from the triangle according to `map_mode`.
+        Magnetic-field axis (in the same length as the cut signals),
+        mapped according to `map_mode`.
     AbCut : ndarray
-        Absorption signal cut to the selected segment(s).
+        Absorption (Channel A) signal corresponding to the selected segment.
     DemodCut : ndarray
-        Demodulated (lock-in) signal cut to the selected segment(s).
-    debug : dict (only if return_debug=True)
-        Keys include:
-        - 'direction'     : 'rising' or 'falling' used for 'half'
-        - 'runs'          : list of (start, end) monotonic runs on the triangle
-        - 'chosen_full'   : (s_full, e_full) indices before edge clipping
-        - 'chosen_clipped': (s0, e0) indices after edge clipping
-        - 'tri_span_full' : (min, max) of the pre-clip triangle in the chosen runs
-        - 'tri_span_local': (min, max) of the post-clip triangle
-        - 'map_mode'      : 'global' or 'local'
+        Demodulated (lock-in) signal corresponding to the selected segment.
+    debug : dict, optional
+        Returned only if `return_debug=True`. Includes:
+        - 'segment'         : 'half' or 'full'
+        - 'direction'       : 'rising' or 'falling'
+        - 'spans'           : list of all candidate (start, end) segments
+        - 'chosen'          : (start, end) indices of selected full segment
+        - 'clipped'         : (start, end) indices after edge trimming
+        - 'tri_span_full'   : (min, max) triangle values before clipping
+        - 'tri_span_local'  : (min, max) triangle values after clipping
+        - 'map_mode'        : 'global' or 'local'
 
     Notes
     -----
-    * Segmentation is performed on the triangle/sawtooth only:
-      - 'half' uses longest monotonic runs (d(tri)/dt > 0 for rising, < 0 for falling),
-        robust to small noise via smoothing and minimal-length filtering.
-      - 'full' uses turning points (sign changes in derivative) to get peak-to-peak windows.
-    * The absorption signal is **not** used to define boundaries. It is only used by
-      `anchor='abspeak'` to pick where to start.
-    * If you need your entire B axis **strictly within** ±range after clipping, use
-      the default `map_mode='global'`.
+    * Segmentation is based entirely on the **triangle/sawtooth waveform**:
+      - Peaks and troughs are detected with prominence filtering to reject noise.
+      - Only one candidate segment is finally chosen according to `anchor`.
+    * The absorption signal (`Ab`) is used **only** for segment selection when
+      `anchor='abspeak'`, never for defining boundaries.
+    * A final monotonicity check removes small nonmonotonic fragments
+      (to prevent duplicated ramps in half-cycles).
+    * Recommended defaults for typical OPM scans:
+        `segment='half'`, `direction='auto'`, `map_mode='global'`,
+        `edge_clip_frac=0.02`.
     """
-    import numpy as np
-    import pandas as pd
 
     # ---------- extract columns ----------
     if isinstance(data, pd.DataFrame):
         df = data.copy()
-        for c in [time_col, ab_col, demod_col]:
+        must = [time_col, ab_col, demod_col]
+        for c in must:
             if c not in df.columns:
                 raise ValueError(f"DataFrame needs '{time_col}', '{ab_col}', '{demod_col}'.")
         if tri_col not in df.columns:
             if require_tri:
                 raise ValueError(f"Missing triangle column '{tri_col}'.")
-            else:
-                raise ValueError("Triangle waveform required for reliable cutting.")
-        t     = df[time_col].to_numpy()
-        Ab    = df[ab_col].to_numpy()
-        demod = df[demod_col].to_numpy()
-        tri   = df[tri_col].to_numpy()
+            raise ValueError("Triangle waveform required for reliable cutting.")
+        t     = df[time_col].to_numpy(float)
+        Ab    = df[ab_col].to_numpy(float)
+        demod = df[demod_col].to_numpy(float)
+        tri   = df[tri_col].to_numpy(float)
     else:
-        arr = np.asarray(data)
+        arr = np.asarray(data, float)
         if arr.ndim < 2 or arr.shape[1] < 4:
             raise ValueError("ndarray must be (N,4): [t, Ab, demod, tri].")
         t, Ab, demod, tri = arr[:,0], arr[:,1], arr[:,2], arr[:,3]
@@ -145,6 +146,7 @@ def one_cycle_cut(
     if N < 16:
         raise ValueError("Not enough samples.")
 
+    # ---------- helpers ----------
     def _smooth(x, w):
         if w is None or w <= 1: return x
         k = np.ones(int(w))/int(w)
@@ -154,58 +156,88 @@ def one_cycle_cut(
         n = max(1, int(len(y)*frac))
         return float(np.median(np.r_[y[:n], y[-n:]]))
 
-    # ---------- build monotonic runs on the triangle ----------
-    tri_s = _smooth(tri, smooth_win)
-    dtri  = np.diff(tri_s)
-
-    if direction == 'auto':
-        dir_mode = 'rising' if np.sum(dtri > 0) >= np.sum(dtri < 0) else 'falling'
-    else:
-        dir_mode = 'rising' if direction == 'rising' else 'falling'
-
-    good = (dtri > 0) if dir_mode == 'rising' else (dtri < 0)
-    edges = np.diff(np.r_[False, good, False])
-    starts = np.where(edges ==  1)[0]
-    ends   = np.where(edges == -1)[0]
-    runs = [(int(s), int(e)) for s, e in zip(starts, ends) if (e - s) >= 8]
-    if not runs:  # last resort
-        runs = [(0, N)]
-
-    # full cycles: merge rise+fall via turning points
-    if segment == 'full':
-        sign = np.sign(dtri)
-        tps = 1 + np.where(sign[:-1] * sign[1:] < 0)[0]  # turning points
-        if len(tps) >= 2:
-            cand = [(int(tps[i]), int(tps[i+1])) for i in range(len(tps)-1)]
-            runs = [rc for rc in cand if (rc[1]-rc[0]) >= 8]
-
-    # ---------- choose anchor run ----------
-    if anchor == 'first':
-        run0 = 0
-    elif anchor == 'last':
-        run0 = len(runs) - 1
-    elif anchor == 'center':
-        mid = N // 2
-        run0 = int(np.argmin([abs((s+e)//2 - mid) for s, e in runs]))
-    else:  # 'abspeak'
+    def _pick_anchor_span(spans, mode='abspeak'):
+        if not spans:
+            raise ValueError("No candidate span found.")
+        if mode == 'first':  return 0
+        if mode == 'last':   return len(spans)-1
+        if mode == 'center':
+            mid = N//2
+            return int(np.argmin([abs((s+e)//2 - mid) for s, e in spans]))
+        # 'abspeak'
         c0 = _edge_baseline(Ab)
-        idx_peak = int(np.argmax(np.abs(Ab - c0)))
-        run0 = 0
-        for i, (s, e) in enumerate(runs):
-            if s <= idx_peak < e:
-                run0 = i
-                break
+        k  = int(np.argmax(np.abs(Ab - c0)))
+        for i, (s,e) in enumerate(spans):
+            if s <= k < e:
+                return i
+        mid = N//2
+        return int(np.argmin([abs((s+e)//2 - mid) for s, e in spans]))
 
-    # ---------- stitch requested number of runs ----------
-    run1 = min(len(runs), run0 + int(cycles))
-    s_full, e_full = runs[run0][0], runs[run1-1][1]
+    # ---------- triangle & robust extrema ----------
+    tri_s = _smooth(tri, smooth_win)
+    tri_lo, tri_hi = float(np.nanmin(tri_s)), float(np.nanmax(tri_s))
+    tri_rng = max(1e-12, tri_hi - tri_lo)
 
-    # Record full (pre-clip) triangle span for 'global' mapping
-    tri_full = tri[s_full:e_full]
-    tr_min_full = float(np.min(tri_full))
-    tr_max_full = float(np.max(tri_full))
+    # robust peaks/troughs: require prominence and distance
+    prom = 0.05 * tri_rng          # 5% of range
+    min_len = max(16, N // 200)    # >=16 samples, or 0.5% of record
+    pk, _ = find_peaks(tri_s, prominence=prom, distance=min_len)
+    tr, _ = find_peaks(-tri_s, prominence=prom, distance=min_len)
+    pk = np.asarray(pk, int)
+    tr = np.asarray(tr, int)
 
-    # edge clipping to avoid artefacts near boundaries
+    # ---------- build candidates ----------
+    spans = []  # list[(s,e)] ; single span will be chosen later
+
+    if segment == 'half':
+        # determine direction if auto
+        dtri = np.diff(tri_s)
+        if direction == 'auto':
+            dir_mode = 'rising' if np.sum(dtri > 0) >= np.sum(dtri < 0) else 'falling'
+        else:
+            dir_mode = 'rising' if direction == 'rising' else 'falling'
+
+        # pair trough->peak (rising) or peak->trough (falling)
+        ord_tp = np.sort(np.r_[pk, tr])
+        for a, b in zip(ord_tp[:-1], ord_tp[1:]):
+            if dir_mode == 'rising' and (a in tr) and (b in pk) and (b - a >= min_len):
+                spans.append((int(a), int(b)))
+            if dir_mode == 'falling' and (a in pk) and (b in tr) and (b - a >= min_len):
+                spans.append((int(a), int(b)))
+
+        # fallback if no robust pairs: longest strictly monotone run with span filter
+        if not spans:
+            good = (dtri > 0) if dir_mode == 'rising' else (dtri < 0)
+            edges = np.diff(np.r_[False, good, False])
+            st = np.where(edges ==  1)[0]
+            en = np.where(edges == -1)[0]
+            for s, e in zip(st, en):
+                if (e - s) >= min_len and (np.ptp(tri_s[s:e]) >= 0.5 * tri_rng):
+                    spans.append((int(s), int(e)))
+            if not spans:
+                spans = [(0, N-1)]  # absolute last resort
+
+    else:  # 'full': peak->peak or trough->trough
+        for arr in (np.sort(pk), np.sort(tr)):
+            if len(arr) >= 2:
+                for a, b in zip(arr[:-1], arr[1:]):
+                    if (b - a) >= min_len and (np.ptp(tri_s[a:b]) >= 0.5 * tri_rng):
+                        spans.append((int(a), int(b)))
+        # last resort: adjacent extrema of any type
+        if not spans:
+            ord_tp = np.sort(np.r_[pk, tr])
+            for a, b in zip(ord_tp[:-1], ord_tp[1:]):
+                if (b - a) >= min_len and (np.ptp(tri_s[a:b]) >= 0.5 * tri_rng):
+                    spans.append((int(a), int(b)))
+        if not spans:
+            spans = [(0, N-1)]
+
+    # ---------- choose ONE span ----------
+    i0 = _pick_anchor_span(spans, anchor)
+    s_full, e_full = spans[i0]
+    e_full = max(e_full, s_full + 1)
+
+    # ---------- edge clipping ----------
     clip = int(max(0.0, float(edge_clip_frac)) * (e_full - s_full))
     s0 = min(max(0, s_full + clip), e_full - 1)
     e0 = max(min(N, e_full - clip), s0 + 1)
@@ -214,12 +246,33 @@ def one_cycle_cut(
     AbCut     = Ab[s0:e0]
     DemodCut  = demod[s0:e0]
 
+    # ---------- final monotonicity guard for HALF ----------
+    if segment == 'half' and (e0 - s0) > 2:
+        dseg = np.diff(tri_cut)
+        want_up = (direction == 'rising') or (direction == 'auto' and tri_s[e_full] > tri_s[s_full])
+        eps = 1e-12
+        step_ok = (dseg > eps) if want_up else (dseg < -eps)
+        keep = np.r_[True, step_ok]
+
+        edges2 = np.diff(np.r_[False, keep, False])
+        st2 = np.flatnonzero(edges2 == 1)
+        en2 = np.flatnonzero(edges2 == -1)
+        if len(st2) and len(en2):
+            i_long = int(np.argmax(en2 - st2))
+            sl = slice(st2[i_long], en2[i_long])
+            tri_cut  = tri_cut[sl]; AbCut = AbCut[sl]; DemodCut = DemodCut[sl]
+        elif keep.any():
+            idx = np.flatnonzero(keep)
+            tri_cut  = tri_cut[idx]; AbCut = AbCut[idx]; DemodCut = DemodCut[idx]
+        # else: keep as-is
+
     # ---------- map triangle -> B ----------
     if map_mode == 'global':
-        # Use pre-clip extrema: clipping does NOT stretch back to ±range
-        tr_lo, tr_hi = tr_min_full, tr_max_full
-    else:  # 'local' (stretches the clipped segment to full range)
-        tr_lo, tr_hi = float(np.min(tri_cut)), float(np.max(tri_cut))
+        tr_lo = float(np.min(tri[s_full:e_full]))
+        tr_hi = float(np.max(tri[s_full:e_full]))
+    else:
+        tr_lo = float(np.min(tri_cut)) if len(tri_cut) else np.nan
+        tr_hi = float(np.max(tri_cut)) if len(tri_cut) else np.nan
 
     if not np.isfinite(tr_lo) or not np.isfinite(tr_hi) or tr_hi <= tr_lo:
         BField = np.full_like(tri_cut, (B_min + B_max)/2.0, dtype=float)
@@ -227,18 +280,18 @@ def one_cycle_cut(
         scale  = (B_max - B_min) / (tr_hi - tr_lo + 1e-30)
         BField = B_min + (tri_cut - tr_lo) * scale
         lo, hi = (B_min, B_max) if B_min <= B_max else (B_max, B_min)
-        BField = np.clip(BField, lo, hi)  # numeric safety
+        BField = np.clip(BField, lo, hi)
 
     if return_debug:
         dbg = dict(
-            direction=dir_mode,
-            runs=runs,
-            chosen_full=(s_full, e_full),
-            chosen_clipped=(s0, e0),
-            tri_span_full=(tr_min_full, tr_max_full),
+            spans=spans,
+            chosen=(s_full, e_full),
+            clipped=(s0, e0),
+            tri_span_full=(float(np.min(tri[s_full:e_full])), float(np.max(tri[s_full:e_full]))),
             tri_span_local=(float(np.min(tri_cut)) if len(tri_cut) else np.nan,
                             float(np.max(tri_cut)) if len(tri_cut) else np.nan),
-            map_mode=map_mode
+            segment=segment,
+            direction=(direction if segment=='half' else 'full'),
         )
         return BField, AbCut, DemodCut, dbg
     return BField, AbCut, DemodCut
