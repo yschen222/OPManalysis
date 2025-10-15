@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import warnings
 from typing import Optional, Tuple, Union
-from scipy.signal import welch
+from scipy.signal import welch, find_peaks
 
 """
 Initial data processing
