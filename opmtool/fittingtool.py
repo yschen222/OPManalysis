@@ -12,7 +12,7 @@ from scipy.optimize import curve_fit
 from scipy.stats import linregress
 from lmfit import Model
 from lmfit.models import GaussianModel, ConstantModel, VoigtModel
-from scipy.special import wofz
+from scipy.special import wofz, voigt_profile as sp_voigt_profile
 import warnings 
 try:
     # NumPy 2.x
@@ -42,7 +42,7 @@ def _baseline_linear_edges(x, y, frac=0.15):
     if len(X) < 3:
         return float(np.median(Y)), 0.0
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RankWarning)  # 1.x/2.x 皆可
+        warnings.simplefilter("ignore", RankWarning)
         b1, b0 = np.polyfit(X, Y, 1)  # y = b1*x + b0
     return float(b0), float(b1)
 
@@ -144,18 +144,91 @@ def _halfmax_width(x, y, baseline):
     except Exception:
         return np.nan
 
-def _voigt_profile(x, sigma, gamma):
-    """Area-normalized Voigt profile implemented via the Faddeeva function wofz."""
-    sigma = max(1e-12, float(abs(sigma)))
-    gamma = max(1e-12, float(abs(gamma)))
-    z = (np.asarray(x) + 1j*gamma) / (sigma*np.sqrt(2.0))
-    return np.real(wofz(z)) / (sigma*np.sqrt(2.0*np.pi))
-
 def _r2(y, yfit):
     """Coefficient of determination R^2."""
+    y, yfit = np.asarray(y, float), np.asarray(yfit, float)
     ss_res = np.sum((y - yfit)**2)
     ss_tot = np.sum((y - np.mean(y))**2)
-    return 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
+    return 1.0 - ss_res/ss_tot if ss_tot > 0 else np.nan
+
+def _halfmax_fwhm(x, y):
+    """Helper for estimating FWHM from half-maximum crossings."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    idx = int(np.argmax(y))
+    y0  = y.min()
+    hm  = y0 + 0.5*(y.max()-y0)
+    # left
+    xL = None
+    for i in range(idx-1, -1, -1):
+        if (y[i]-hm)*(y[i+1]-hm) <= 0:
+            t = (hm - y[i])/(y[i+1]-y[i] + 1e-300)
+            xL = x[i] + t*(x[i+1]-x[i]); break
+    # right
+    xR = None
+    for i in range(idx, len(x)-1):
+        if (y[i]-hm)*(y[i+1]-hm) <= 0:
+            t = (hm - y[i])/(y[i+1]-y[i] + 1e-300)
+            xR = x[i] + t*(x[i+1]-x[i]); break
+    if xL is None or xR is None: return None
+    return float(abs(xR - xL))
+
+
+# =========================
+# Model functions for curve_fit
+# =========================
+def gauss_model(x, A, x0, sigma, C):
+    return C + A * np.exp(-(x-x0)**2/(2*sigma**2))
+
+def lorentz_model(x, A, x0, gamma, C):
+    return C + A * (gamma**2)/((x-x0)**2 + gamma**2)
+
+def voigt_model(x, A, x0, sigma, gamma, C):
+    """Voigt profile using scipy.special.voigt_profile (area-normalized kernel)."""
+    return C + A * sp_voigt_profile(x - x0, sigma, gamma)
+
+
+# =========================
+# Internal Gaussian/Lorentzian fits for Voigt seeding
+# =========================
+def _fit_gaussian_internal(x, y, p0=None, maxfev=20000):
+    """Internal Gaussian fit using curve_fit."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    C0 = _edge_baseline(y)
+    y0 = y - C0
+    i0 = int(np.argmax(y0))
+    x0 = float(x[i0])
+    f0 = _halfmax_fwhm(x, y) or max(1e-3, (x.max()-x.min())/20)
+    sigma0 = max(1e-9, f0/2.355)
+    A0 = float((y.max()-C0))
+    if isinstance(p0, dict):
+        A0     = p0.get('A', A0)
+        x0     = p0.get('x0', x0)
+        sigma0 = max(1e-12, p0.get('sigma', sigma0))
+        C0     = p0.get('C', C0)
+    popt, pcov = curve_fit(gauss_model, x, y, p0=[A0, x0, sigma0, C0], maxfev=maxfev)
+    yfit = gauss_model(x, *popt)
+    FWHM = 2.355*abs(popt[2])
+    return {"popt": popt, "pcov": pcov, "yfit": yfit, "FWHM": FWHM, "R2": _r2(y, yfit)}
+
+def _fit_lorentzian_internal(x, y, p0=None, maxfev=20000):
+    """Internal Lorentzian fit using curve_fit."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    C0 = _edge_baseline(y)
+    y0 = y - C0
+    i0 = int(np.argmax(np.abs(y0)))
+    x0 = float(x[i0])
+    f0 = _halfmax_fwhm(x, y) or max(1e-3, (x.max()-x.min())/20)
+    gamma0 = max(1e-9, f0/2.0)
+    A0 = float(y.max()-C0)
+    if isinstance(p0, dict):
+        A0     = p0.get('A', A0)
+        x0     = p0.get('x0', x0)
+        gamma0 = max(1e-12, p0.get('gamma', gamma0))
+        C0     = p0.get('C', C0)
+    popt, pcov = curve_fit(lorentz_model, x, y, p0=[A0, x0, gamma0, C0], maxfev=maxfev)
+    yfit = lorentz_model(x, *popt)
+    FWHM = 2.0*abs(popt[2])
+    return {"popt": popt, "pcov": pcov, "yfit": yfit, "FWHM": FWHM, "R2": _r2(y, yfit)}
 
 
 # =========================
@@ -400,26 +473,50 @@ def gauss_fit(data, p0=None, bounds=None):
 
 
 # =========================
-# Voigt + constant baseline
+# Voigt fit with G/L seed strategy (NEW VERSION)
 # =========================
-def voigt_fit(data, p0=None, bounds=None):
+def voigt_fit(data, p0=None, bounds=None, maxfev=30000, use_model_selection=True):
     """
-    Fit a Voigt (Gaussian ⊗ Lorentzian) profile with a constant baseline.
-
+    Fit a Voigt profile using Gaussian/Lorentzian results to seed the initial values.
+    
+    This new implementation:
+    1. First fits both Gaussian and Lorentzian models separately
+    2. Uses the better-fitting model to generate smart initial guesses for Voigt
+    3. Performs Voigt fit with scipy.optimize.curve_fit
+    4. Optionally compares models via AIC/BIC
+    
     Parameters
     ----------
-    data : DataFrame or ndarray with columns 'B','Ab'
+    data : DataFrame or ndarray
+        Data with columns 'B' (field) and 'Ab' (signal), or N×2 array.
     p0 : dict | None
         Optional initial guess with keys {'amplitude','center','sigma','gamma','offset'}.
-        If None, seeds are estimated automatically.
+        If None, seeds are auto-generated from G/L fits.
     bounds : dict | None
         Optional bounds for the same keys.
-
+    maxfev : int, optional
+        Maximum function evaluations for curve_fit (default: 30000).
+    use_model_selection : bool, optional
+        If True, selects best model (Gaussian/Lorentzian/Voigt) based on AIC.
+        
     Returns
     -------
     dict with keys:
-        out, S_fit, Params, FWHM (Olivero–Longbothum), sigma, gamma, Data, R2
+        Voigt: {popt, pcov, yfit, Params, FWHM, FWHM_L, FWHM_G, R2}
+        Gaussian: {popt, yfit, FWHM, R2}
+        Lorentzian: {popt, yfit, FWHM, R2}
+        AIC_BIC: {AIC: {G, L, V}, BIC: {G, L, V}}
+        ModelSelected: "Gaussian" | "Lorentzian" | "Voigt"
+        Data: DataFrame with all fitted curves
+        
+    For compatibility with old interface, also includes:
+        out: dict (mimics lmfit structure with best_fit, params as dict)
+        S_fit: best model's fitted curve
+        Params: best model's parameters
+        FWHM, sigma, gamma: from best model
+        R2: from best model
     """
+    # Input normalization
     if isinstance(data, np.ndarray):
         if data.ndim != 2 or data.shape[1] < 2:
             raise ValueError("numpy array must be N×2 (B, Ab)")
@@ -429,89 +526,149 @@ def voigt_fit(data, p0=None, bounds=None):
         if 'B' not in df.columns or 'Ab' not in df.columns:
             if df.shape[1] >= 2:
                 df = df.copy()
-                df.columns = ['B', 'Ab'] + list(df.columns[2:])
+                df.columns = ['B','Ab'] + list(df.columns[2:])
             else:
                 raise ValueError("data must contain columns B and Ab")
-    x, y = df['B'].values, df['Ab'].values
+    x = df['B'].to_numpy(float)
+    y = df['Ab'].to_numpy(float)
 
-    vmod = VoigtModel(prefix='v_')
-    cmod = ConstantModel(prefix='c_')
-    model = vmod + cmod
+    # (1) Fit Gaussian and Lorentzian separately
+    gfit = _fit_gaussian_internal(x, y)
+    lfit = _fit_lorentzian_internal(x, y)
 
-    # Auto seeds: remove linear baseline, refine center; let vmod.guess help shape
-    c0_lin, c1_lin = _baseline_linear_edges(x, y, frac=0.15)
-    y_corr = y - (c0_lin + c1_lin*x)
-    idx = np.argmax(np.abs(y_corr))
-    center0 = _refine_center_quadratic(x, y_corr, idx, win=3)
+    # (2) Generate Voigt initial values from better-fitting model
+    if gfit["R2"] >= lfit["R2"]:
+        C0 = float(np.median(y - gfit["yfit"] + gfit["popt"][3]))
+        x0 = float(gfit["popt"][1])
+        F_guess = gfit["FWHM"]
+        # Gaussian-biased: most width in sigma
+        sigma0 = max(1e-10, F_guess/2.355 * 0.9)
+        gamma0 = max(1e-10, F_guess/2.0   * 0.1)
+    else:
+        C0 = float(np.median(y - lfit["yfit"] + lfit["popt"][3]))
+        x0 = float(lfit["popt"][1])
+        F_guess = lfit["FWHM"]
+        # Lorentzian-biased: most width in gamma
+        sigma0 = max(1e-10, F_guess/2.355 * 0.1)
+        gamma0 = max(1e-10, F_guess/2.0   * 0.9)
 
-    c0_const = _edge_baseline(y)  # initial constant offset for the ConstantModel
-    try:
-        vparams = vmod.guess(y - c0_const, x=x)
-    except Exception:
-        span = (x.max()-x.min()) if x.max()>x.min() else 1.0
-        vparams = vmod.make_params(
-            v_amplitude=(y[idx]-c0_const)*np.sqrt(2*np.pi)*(span/10),
-            v_center=center0, v_sigma=span/20, v_gamma=span/20
-        )
+    # amplitude using peak height × FWHM (voigt_profile is area-normalized)
+    A0 = float((y.max() - C0) * max(F_guess, 1e-6))
 
-    pars = model.make_params()
-    # Important: do NOT abs() amplitude/center; only enforce positivity on sigma/gamma
-    pars['v_amplitude'].set(value=vparams['v_amplitude'].value)
-    pars['v_center'   ].set(value=center0)
-    pars['v_sigma'    ].set(value=max(1e-12, abs(vparams['v_sigma' ].value)))
-    pars['v_gamma'    ].set(value=max(1e-12, abs(vparams['v_gamma' ].value)))
-    pars['c_c'        ].set(value=c0_const)
-
-    # Loose automatic bounds for center if not given
-    span = (x.max() - x.min()) if x.max() > x.min() else 1.0
-    if not (isinstance(bounds, dict) and 'center' in bounds):
-        pars['v_center'].set(min=center0 - 0.25*span, max=center0 + 0.25*span)
-
-    # Manual p0 override
+    # User override for p0
     if isinstance(p0, dict):
-        if 'amplitude' in p0: pars['v_amplitude'].set(value=p0['amplitude'])
-        if 'center'    in p0: pars['v_center'   ].set(value=p0['center'])
-        if 'sigma'     in p0: pars['v_sigma'    ].set(value=max(1e-12, abs(p0['sigma'])))
-        if 'gamma'     in p0: pars['v_gamma'    ].set(value=max(1e-12, abs(p0['gamma'])))
-        if 'offset'    in p0: pars['c_c'        ].set(value=p0['offset'])
+        A0     = p0.get('amplitude', A0)
+        x0     = p0.get('center',    x0)
+        sigma0 = max(1e-12, p0.get('sigma', sigma0))
+        gamma0 = max(1e-12, p0.get('gamma', gamma0))
+        C0     = p0.get('offset',    C0)
+
+    p0_vec = [A0, x0, sigma0, gamma0, C0]
 
     # Bounds
     if isinstance(bounds, dict):
-        if 'amplitude' in bounds:
-            lo, hi = bounds['amplitude']; pars['v_amplitude'].set(min=lo, max=hi)
-        if 'center' in bounds:
-            lo, hi = bounds['center']; pars['v_center'].set(min=lo, max=hi)
-        if 'sigma' in bounds:
-            lo, hi = bounds['sigma']; pars['v_sigma'].set(min=max(1e-12, lo), max=hi)
-        if 'gamma' in bounds:
-            lo, hi = bounds['gamma']; pars['v_gamma'].set(min=max(1e-12, lo), max=hi)
-        if 'offset' in bounds:
-            lo, hi = bounds['offset']; pars['c_c'].set(min=lo, max=hi)
+        def _pair(k, default):
+            return bounds[k] if k in bounds else default
+        lo = [_pair('amplitude', -np.inf), _pair('center', x.min()),
+              _pair('sigma', 1e-12), _pair('gamma', 1e-12), _pair('offset', -np.inf)]
+        hi = [_pair('amplitude',  np.inf), _pair('center', x.max()),
+              _pair('sigma', np.inf), _pair('gamma', np.inf), _pair('offset',  np.inf)]
+        bounds_vec = (lo, hi)
+    else:
+        span = x.max() - x.min() if x.max() > x.min() else 1.0
+        bounds_vec = ([-np.inf, x0-0.25*span, 1e-12, 1e-12, -np.inf],
+                      [ np.inf, x0+0.25*span,  np.inf,  np.inf,  np.inf])
 
-    out = model.fit(y, pars, x=x)
-    yfit = out.best_fit
+    # (3) Voigt fit using curve_fit
+    popt, pcov = curve_fit(voigt_model, x, y, p0=p0_vec, bounds=bounds_vec, maxfev=maxfev)
+    A, xc, sig, gam, C = popt
+    yfit = voigt_model(x, *popt)
 
-    amp = out.params['v_amplitude'].value
-    cen = out.params['v_center'].value
-    sig = abs(out.params['v_sigma'].value)
-    gam = abs(out.params['v_gamma'].value)
-    off = out.params['c_c'].value
+    # FWHM using Olivero–Longbothum approximation
+    GammaL = 2.0*abs(gam)
+    FG     = 2.0*np.sqrt(2*np.log(2))*abs(sig)
+    F_voigt = 0.5346*GammaL + np.sqrt(0.2166*GammaL**2 + FG**2)
 
-    # Voigt FWHM via Olivero–Longbothum approximation
-    Gamma = 2.0*gam
-    G = 2.0*np.sqrt(2.0*np.log(2.0))*sig
-    FWHM = 0.5346*Gamma + np.sqrt(0.2166*Gamma**2 + G**2)
+    # (4) Model comparison via AIC/BIC
+    def _aic_bic(y, yhat, k):
+        y, yhat = np.asarray(y), np.asarray(yhat)
+        resid = y - yhat
+        s2 = np.mean(resid**2) + 1e-300
+        n = len(y)
+        ll = -0.5*n*(np.log(2*np.pi*s2) + 1)
+        aic = 2*k - 2*ll
+        bic = k*np.log(n) - 2*ll
+        return aic, bic
 
-    return {
-        "out": out,
-        "S_fit": yfit,
-        "Params": {"amplitude": amp, "center": cen, "sigma": sig, "gamma": gam, "offset": off},
-        "FWHM": FWHM,
-        "sigma": sig,
-        "gamma": gam,
-        "Data": df.assign(S_fit=yfit),
-        "R2": _r2(y, yfit)
+    aic_g, bic_g = _aic_bic(y, gfit["yfit"], k=4)
+    aic_l, bic_l = _aic_bic(y, lfit["yfit"], k=4)
+    aic_v, bic_v = _aic_bic(y, yfit,        k=5)
+
+    model_pick = "Voigt"
+    if use_model_selection:
+        best_aic = min(aic_g, aic_l, aic_v)
+        if best_aic == aic_g: model_pick = "Gaussian"
+        elif best_aic == aic_l: model_pick = "Lorentzian"
+        else: model_pick = "Voigt"
+
+    # (5) Prepare output for backward compatibility
+    voigt_result = {
+        "Voigt": {
+            "popt": popt, "pcov": pcov, "yfit": yfit,
+            "Params": {"amplitude": A, "center": xc, "sigma": abs(sig), "gamma": abs(gam), "offset": C},
+            "FWHM": F_voigt, "FWHM_L": 2.0*abs(gam), "FWHM_G": 2.355*abs(sig),
+            "R2": _r2(y, yfit)
+        },
+        "Gaussian": {
+            "popt": gfit["popt"], "yfit": gfit["yfit"], "FWHM": gfit["FWHM"], "R2": gfit["R2"]
+        },
+        "Lorentzian": {
+            "popt": lfit["popt"], "yfit": lfit["yfit"], "FWHM": lfit["FWHM"], "R2": lfit["R2"]
+        },
+        "AIC_BIC": {"AIC": {"G": aic_g, "L": aic_l, "V": aic_v}, 
+                    "BIC": {"G": bic_g, "L": bic_l, "V": bic_v}},
+        "ModelSelected": model_pick,
+        "Data": df.assign(Voigt_fit=yfit, Gauss_fit=gfit["yfit"], Lorentz_fit=lfit["yfit"])
     }
+
+    # Add backward-compatible fields based on selected model
+    if model_pick == "Gaussian":
+        best_params = {"amplitude": gfit["popt"][0], "center": gfit["popt"][1], 
+                      "sigma": abs(gfit["popt"][2]), "gamma": None, "offset": gfit["popt"][3]}
+        best_fit = gfit["yfit"]
+        best_fwhm = gfit["FWHM"]
+        best_sigma = abs(gfit["popt"][2])
+        best_gamma = None
+        best_r2 = gfit["R2"]
+    elif model_pick == "Lorentzian":
+        best_params = {"amplitude": lfit["popt"][0], "center": lfit["popt"][1],
+                      "sigma": None, "gamma": abs(lfit["popt"][2]), "offset": lfit["popt"][3]}
+        best_fit = lfit["yfit"]
+        best_fwhm = lfit["FWHM"]
+        best_sigma = None
+        best_gamma = abs(lfit["popt"][2])
+        best_r2 = lfit["R2"]
+    else:  # Voigt
+        best_params = voigt_result["Voigt"]["Params"]
+        best_fit = yfit
+        best_fwhm = F_voigt
+        best_sigma = abs(sig)
+        best_gamma = abs(gam)
+        best_r2 = voigt_result["Voigt"]["R2"]
+
+    # Mimic lmfit output structure for compatibility
+    voigt_result["out"] = {
+        "best_fit": best_fit,
+        "params": best_params
+    }
+    voigt_result["S_fit"] = best_fit
+    voigt_result["Params"] = best_params
+    voigt_result["FWHM"] = best_fwhm
+    voigt_result["sigma"] = best_sigma
+    voigt_result["gamma"] = best_gamma
+    voigt_result["R2"] = best_r2
+
+    return voigt_result
 
 
 # =========================
@@ -725,11 +882,11 @@ def dispersion_lorentz_fit(
     model = Model(f)
 
     # ---------- helpers ----------
-    def _edge_baseline(y, frac=0.1):
+    def _edge_baseline_loc(y, frac=0.1):
         n = max(1, int(len(y)*frac))
         return float(np.median(np.r_[y[:n], y[-n:]]))
 
-    def _baseline_linear_edges(x, y, frac=0.15):
+    def _baseline_linear_edges_loc(x, y, frac=0.15):
         n = max(3, int(len(x)*frac))
         X = np.r_[x[:n], x[-n:]]
         Y = np.r_[y[:n], y[-n:]]
@@ -744,7 +901,7 @@ def dispersion_lorentz_fit(
         return np.convolve(v, k, mode='same')
 
     # ---------- seeds on a deduped, increasing, smoothed grid ----------
-    c0_lin, c1_lin = _baseline_linear_edges(x_full, y_full, frac=0.15)
+    c0_lin, c1_lin = _baseline_linear_edges_loc(x_full, y_full, frac=0.15)
     y_lin = y_full - (c0_lin + c1_lin*x_full)
 
     # unique & increasing for seed estimation
@@ -814,7 +971,7 @@ def dispersion_lorentz_fit(
         b0 = 4.0 / span
         a0 = 2.0 * np.max(np.abs(yu))
 
-    c0 = _edge_baseline(y_full)
+    c0 = _edge_baseline_loc(y_full)
 
     # ---------- p0 handling ----------
     if p0 is None:
@@ -932,4 +1089,3 @@ def dispersion_lorentz_fit(
         "LinearRange": linear_range,
         "FitResult": (lambda B: f(B, a, b, center, coff)),
     }
-

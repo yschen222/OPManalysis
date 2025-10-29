@@ -57,9 +57,9 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
 
         need_slope = _want("slope") or _want("sloper2") or _want("sensitivity")
         need_noise = _want("noisepsd") or _want("sensitivity")
-        need_voigt = any(_want(k) for k in ("voigtfwhm","voigtgamma","voigtsigma","voigtR2"))
-        need_lor   = any(_want(k) for k in ("lorentzfwhm","lorentzR2"))
-        need_gau   = any(_want(k) for k in ("gaussianfwhm","gaussianR2"))
+        need_voigt = any(_want(k) for k in ("voigtfwhm","voigtgamma","voigtsigma","voigtr2"))
+        need_lor   = any(_want(k) for k in ("lorentzfwhm","lorentzr2"))
+        need_gau   = any(_want(k) for k in ("gaussianfwhm","gaussianr2"))
 
         slope_val = np.nan; slope_R2 = np.nan; disp = None
         if need_slope:
@@ -105,6 +105,7 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
 
         lf = gf = vf = None
         if "B" in df_bs.columns:
+            # === Lorentzian fit ===
             if need_lor:
                 try:
                     lf = lorentz_fit(df_bs[["B","Ab"]])
@@ -112,6 +113,8 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                     lorentz_R2   = first_scalar(lf.get("R2"))
                 except Exception as e:
                     print(f"[WARN] {sub.name}: Lorentz fit failed: {e}")
+            
+            # === Gaussian fit ===
             if need_gau:
                 try:
                     gf = gauss_fit(df_bs[["B","Ab"]])
@@ -119,22 +122,51 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                     gaussian_R2   = first_scalar(gf.get("R2"))
                 except Exception as e:
                     print(f"[WARN] {sub.name}: Gaussian fit failed: {e}")
+            
+            # === Voigt fit (NEW VERSION) ===
             if need_voigt:
                 try:
-                    vf      = voigt_fit(df_bs[["B","Ab"]])
-                    v_sigma = float(vf.get("sigma", np.nan))
-                    v_gamma = float(vf.get("gamma", np.nan))
-                    vR2     = first_scalar(vf.get("R2"))
-                    L = 2.0*abs(v_gamma)
-                    G = 2.0*np.sqrt(2.0*np.log(2.0))*abs(v_sigma)
-                    voigt_FWHM = 0.5346*L + np.sqrt(0.2166*L*L + G*G)
+                    vf = voigt_fit(df_bs[["B","Ab"]])
+                    
+                    # Extract Voigt-specific results
+                    # The new voigt_fit returns nested structure with Voigt/Gaussian/Lorentzian sub-dicts
+                    if "Voigt" in vf:
+                        # Use the Voigt model's parameters
+                        voigt_params = vf["Voigt"]["Params"]
+                        v_sigma = float(voigt_params.get("sigma", np.nan))
+                        v_gamma = float(voigt_params.get("gamma", np.nan))
+                        voigt_FWHM = float(vf["Voigt"].get("FWHM", np.nan))
+                        vR2 = first_scalar(vf["Voigt"].get("R2", np.nan))
+                    else:
+                        # Fallback to top-level (backward compatibility)
+                        v_sigma = float(vf.get("sigma", np.nan))
+                        v_gamma = float(vf.get("gamma", np.nan))
+                        vR2 = first_scalar(vf.get("R2", np.nan))
+                        
+                        # Recalculate FWHM if needed
+                        if "FWHM" in vf:
+                            voigt_FWHM = float(vf["FWHM"])
+                        else:
+                            L = 2.0*abs(v_gamma)
+                            G = 2.0*np.sqrt(2.0*np.log(2.0))*abs(v_sigma)
+                            voigt_FWHM = 0.5346*L + np.sqrt(0.2166*L*L + G*G)
+                    
+                    # Optional: Log model selection results
+                    if "ModelSelected" in vf:
+                        print(f"[INFO] {sub.name}: Best model = {vf['ModelSelected']} "
+                              f"(AIC: G={vf['AIC_BIC']['AIC']['G']:.1f}, "
+                              f"L={vf['AIC_BIC']['AIC']['L']:.1f}, "
+                              f"V={vf['AIC_BIC']['AIC']['V']:.1f})")
+                    
                 except Exception as e:
                     print(f"[WARN] {sub.name}: Voigt fit failed: {e}")
 
+            # === Plotting ===
             if PLOT_ENABLED and (need_lor or need_gau or need_voigt):
                 plot_save_lineshapes(sub, df_bs["B"].to_numpy(), df_bs["Ab"].to_numpy(),
                                      need_lor, lf, need_gau, gf, need_voigt, vf)
 
+        # === Noise calculation ===
         noise_rms = np.nan
         if need_noise:
             try:
@@ -150,10 +182,12 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
             except Exception as e:
                 print(f"[WARN] {session_dir.name}/{sub.name}: noise calc failed: {e}")
 
+        # === Sensitivity calculation ===
         sensitivity = np.nan
         if _want("sensitivity") and np.isfinite(noise_rms) and np.isfinite(slope_val) and slope_val != 0:
             sensitivity = noise_rms / abs(slope_val)
 
+        # === Build output row ===
         row = {
             "label": sub.name,
             "folder_name": str(sub),
