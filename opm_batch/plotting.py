@@ -62,7 +62,7 @@ def plot_save_lineshapes(sub_dir: Path, B, Ab, want_lor, lf, want_gau, gf, want_
             x, y = x[idx], y[idx]
         
         fig, ax = plt.subplots(figsize=(6,4))
-        ax.plot(x, y, ".", ms=2, alpha=0.5, label="data", color='gray')
+        ax.plot(x, y, ".", ms=3, alpha=1, label="data", color='k')
         xx = np.linspace(np.nanmin(B), np.nanmax(B), 1200)
         
         # === Lorentzian fit ===
@@ -124,7 +124,7 @@ def plot_save_lineshapes(sub_dir: Path, B, Ab, want_lor, lf, want_gau, gf, want_
                     return np.real(wofz(z)) / (sigma*np.sqrt(2*np.pi))
                 
                 yy = A*voigt_area(xx-mu, sig, gam) + c0
-                ax.plot(xx, yy, "-", lw=2.5, color='lime', 
+                ax.plot(xx, yy, ":", lw=2.5, color='lime', 
                        label=f"Voigt (R²={r2:.4f}){label_suffix}")
         
         ax.set_xlabel("B (nT)", fontsize=11)
