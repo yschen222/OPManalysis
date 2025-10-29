@@ -197,7 +197,7 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
         if _want("slope"):        row[METRIC_COLNAMES["slope"]]       = slope_val * 1e3
         if _want("sloper2"):      row[METRIC_COLNAMES["sloper2"]]     = slope_R2
         if _want("noisepsd"):     row[METRIC_COLNAMES["noisepsd"]]    = noise_rms * 1e6
-        if _want("sensitivity"):  row[METRIC_COLNAMES["sensitivity"]] = sensitivity * 1e12
+        if _want("sensitivity"):  row[METRIC_COLNAMES["sensitivity"]] = sensitivity * 1e3
         if _want("lorentzfwhm"):  row[METRIC_COLNAMES["lorentzfwhm"]] = lorentz_FWHM
         if _want("lorentzr2"):    row[METRIC_COLNAMES["lorentzr2"]]   = lorentz_R2
         if _want("gaussianfwhm"): row[METRIC_COLNAMES["gaussianfwhm"]]= gaussian_FWHM
