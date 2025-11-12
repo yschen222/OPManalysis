@@ -45,15 +45,16 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
         # map to B and cut one segment
         try:
             BField, AbCut, DemodCut = one_cycle_cut(
-                df_scan.rename(columns={"tri":"tri"}),
-                B_range=B_range_used, segment=LINE_SEGMENT, direction=LINE_DIRECTION,
+                df_scan.rename(columns={"tri": "tri"}),
+                B_range=B_range_used,
+                segment=LINE_SEGMENT, direction=LINE_DIRECTION,
                 time_col="time", ab_col="Ab", demod_col="demod", tri_col="tri",
                 map_mode='global', smooth_win=5
             )
             df_bs = pd.DataFrame({"B": BField, "Ab": AbCut, "demod": DemodCut})
         except Exception as e:
             print(f"[WARN] {session_dir.name}/{sub.name}: one_cycle_cut failed: {e}")
-            df_bs = pd.DataFrame({"Ab": df_scan["Ab"], "demod": df_scan["demod"]})
+            df_bs = pd.DataFrame({"Ab": df_scan.get("Ab"), "demod": df_scan.get("demod")}).dropna()
 
         need_slope = _want("slope") or _want("sloper2") or _want("sensitivity")
         need_noise = _want("noisepsd") or _want("sensitivity")
@@ -64,7 +65,7 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
         slope_val = np.nan; slope_R2 = np.nan; disp = None
         if need_slope:
             try:
-                if "B" in df_bs.columns:
+                if "B" in df_bs.columns and df_bs["B"].notna().any():
                     B_all = df_bs["B"].to_numpy(float)
                     Y_all = df_bs["demod"].to_numpy(float)
                     Bspan = float(B_all.max() - B_all.min())
@@ -104,7 +105,7 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
         _w.filterwarnings("ignore", message=r"Using UFloat objects with std_dev==0.*", category=UserWarning, module=r"uncertainties\.core")
 
         lf = gf = vf = None
-        if "B" in df_bs.columns:
+        if "B" in df_bs.columns and df_bs["B"].notna().any():
             # === Lorentzian fit ===
             if need_lor:
                 try:
@@ -123,41 +124,38 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                 except Exception as e:
                     print(f"[WARN] {sub.name}: Gaussian fit failed: {e}")
             
-            # === Voigt fit (NEW VERSION) ===
+            # === Voigt fit (handles new structured return + fallback) ===
             if need_voigt:
                 try:
                     vf = voigt_fit(df_bs[["B","Ab"]])
-                    
-                    # Extract Voigt-specific results
-                    # The new voigt_fit returns nested structure with Voigt/Gaussian/Lorentzian sub-dicts
-                    if "Voigt" in vf:
-                        # Use the Voigt model's parameters
+
+                    if isinstance(vf, dict) and "Voigt" in vf and "Params" in vf["Voigt"]:
+                        # New structured layout
                         voigt_params = vf["Voigt"]["Params"]
                         v_sigma = float(voigt_params.get("sigma", np.nan))
                         v_gamma = float(voigt_params.get("gamma", np.nan))
                         voigt_FWHM = float(vf["Voigt"].get("FWHM", np.nan))
                         vR2 = first_scalar(vf["Voigt"].get("R2", np.nan))
                     else:
-                        # Fallback to top-level (backward compatibility)
+                        # Backward compatible flat layout
                         v_sigma = float(vf.get("sigma", np.nan))
                         v_gamma = float(vf.get("gamma", np.nan))
                         vR2 = first_scalar(vf.get("R2", np.nan))
-                        
-                        # Recalculate FWHM if needed
                         if "FWHM" in vf:
                             voigt_FWHM = float(vf["FWHM"])
                         else:
                             L = 2.0*abs(v_gamma)
                             G = 2.0*np.sqrt(2.0*np.log(2.0))*abs(v_sigma)
                             voigt_FWHM = 0.5346*L + np.sqrt(0.2166*L*L + G*G)
-                    
-                    # Optional: Log model selection results
-                    if "ModelSelected" in vf:
-                        print(f"[INFO] {sub.name}: Best model = {vf['ModelSelected']} "
-                              f"(AIC: G={vf['AIC_BIC']['AIC']['G']:.1f}, "
-                              f"L={vf['AIC_BIC']['AIC']['L']:.1f}, "
-                              f"V={vf['AIC_BIC']['AIC']['V']:.1f})")
-                    
+
+                    if isinstance(vf, dict) and "ModelSelected" in vf and "AIC_BIC" in vf:
+                        try:
+                            a = vf["AIC_BIC"]["AIC"]
+                            print(f"[INFO] {sub.name}: Best model = {vf['ModelSelected']} "
+                                  f"(AIC: G={a.get('G',np.nan):.1f}, L={a.get('L',np.nan):.1f}, V={a.get('V',np.nan):.1f})")
+                        except Exception:
+                            pass
+
                 except Exception as e:
                     print(f"[WARN] {sub.name}: Voigt fit failed: {e}")
 
@@ -176,9 +174,8 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                     noise_csv = None
                 if noise_csv is not None:
                     noise_df_raw = read_csv_safely(noise_csv)
-                    noise_df_std = standardize_noise_df(noise_df_raw)
-                    noise_rms = compute_noise(noise_df_std)
-                    # （如要畫 PSD，可在此呼叫你的 PSD 畫圖函數）
+                    noise_df_std = standardize_noise_df(noise_df_raw)   # ➜ 兩欄 [time, signal]
+                    noise_rms = compute_noise(noise_df_std)             # ➜ 直接使用
             except Exception as e:
                 print(f"[WARN] {session_dir.name}/{sub.name}: noise calc failed: {e}")
 
