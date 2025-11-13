@@ -2,9 +2,17 @@ from __future__ import annotations
 from pathlib import Path
 import warnings, numpy as np, pandas as pd
 from typing import Dict
-from opmtool import dispersion_lorentz_fit, voigt_fit, lorentz_fit, gauss_fit, one_cycle_cut
-from .config import *
-from .metrics import force_include_r2_columns, first_scalar, compute_noise, extract_sweep_value
+
+# 外部工具
+from opmtool import (
+    dispersion_lorentz_fit, voigt_fit, lorentz_fit, gauss_fit, one_cycle_cut
+)
+
+from . import config as cfg
+
+from .metrics import (
+    force_include_r2_columns, first_scalar, compute_noise, extract_sweep_value
+)
 from .io_utils import (
     read_csv_safely, pick_scan_csv, pick_noise_csv,
     standardize_scan_df, standardize_noise_df, load_experiment_rules, choose_rule_for_label
@@ -13,23 +21,21 @@ from .layout import detect_layout
 from .reporting import write_outputs
 from .plotting import plot_save_dispersion, plot_save_lineshapes
 
-# expand metric selection (auto include R²)
-_SELECT = force_include_r2_columns(set(SELECT_METRICS))
+_SELECT = force_include_r2_columns(set(cfg.SELECT_METRICS))
 
 def _want(name: str) -> bool:
     return name.lower() in _SELECT
 
 def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> pd.DataFrame:
     rows = []
-    subdirs = [p for p in sorted(session_dir.iterdir()) if p.is_dir() and p.name != NOISE_SUBDIR]
+    subdirs = [p for p in sorted(session_dir.iterdir()) if p.is_dir() and p.name != cfg.NOISE_SUBDIR]
     if not subdirs:
         subdirs = [session_dir]  # treat itself as one dataset
 
     for sub in subdirs:
-        # choose B-range rule
         B_range_used, _ = choose_rule_for_label(rules_from_txt, sub.name)
         if not B_range_used:
-            B_range_used = B_RANGE_NT
+            B_range_used = cfg.B_RANGE_NT
 
         scan_csv = pick_scan_csv(sub, root=session_dir)
         if scan_csv is None:
@@ -42,12 +48,13 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
             print(f"[WARN] {session_dir.name}/{sub.name}: scan parse failed: {e}")
             continue
 
-        # map to B and cut one segment
+        # === map to B and cut one segment ===
         try:
             BField, AbCut, DemodCut = one_cycle_cut(
                 df_scan.rename(columns={"tri": "tri"}),
                 B_range=B_range_used,
-                segment=LINE_SEGMENT, direction=LINE_DIRECTION,
+                segment=cfg.LINE_SEGMENT,
+                direction=cfg.LINE_DIRECTION,
                 time_col="time", ab_col="Ab", demod_col="demod", tri_col="tri",
                 map_mode='global', smooth_win=5
             )
@@ -69,20 +76,24 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                     B_all = df_bs["B"].to_numpy(float)
                     Y_all = df_bs["demod"].to_numpy(float)
                     Bspan = float(B_all.max() - B_all.min())
-                    half  = max(1e-9, Bspan * (WIDTHRATIO/100.0))
-                    m = (B_all >= (DISP_CENTER - half)) & (B_all <= (DISP_CENTER + half))
+                    half  = max(1e-9, Bspan * (cfg.WIDTHRATIO/100.0))
+                    m = (B_all >= (cfg.DISP_CENTER - half)) & (B_all <= (cfg.DISP_CENTER + half))
                     if m.sum() < 12:
                         for s in (1.5, 2.0, 3.0):
-                            mm = (B_all >= (DISP_CENTER - half*s)) & (B_all <= (DISP_CENTER + half*s))
+                            mm = (B_all >= (cfg.DISP_CENTER - half*s)) & (B_all <= (cfg.DISP_CENTER + half*s))
                             if mm.sum() >= 12:
                                 m = mm; break
                         else:
                             m = np.ones_like(B_all, dtype=bool)
                     Bf, Yf = B_all[m], Y_all[m]
                     df_focus = pd.DataFrame({"x": Bf, "y": Yf})
-                    disp = dispersion_lorentz_fit(df_focus, p0={'center': DISP_CENTER, 'amplitude': DISP_P0_AMPL}, max_rel_err=0.01)
+                    disp = dispersion_lorentz_fit(
+                        df_focus,
+                        p0={'center': cfg.DISP_CENTER, 'amplitude': cfg.DISP_P0_AMPL},
+                        max_rel_err=0.01
+                    )
                     slope_val = float(disp["Slope"]); slope_R2 = float(disp["R2"])
-                    if PLOT_ENABLED and np.isfinite(slope_val):
+                    if cfg.PLOT_ENABLED and np.isfinite(slope_val):
                         try:
                             lin_lo, lin_hi = disp.get("LinearRange", (None, None))
                             ctr   = disp["Params"]["center"]; c0 = disp["Params"]["offset"]
@@ -91,8 +102,12 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                         except Exception as e:
                             print(f"[WARN] slope plot failed: {sub.name}: {e}")
                 else:
-                    df_disp = df_bs.rename(columns={"Ab": "x", "demod": "y"})[["x", "y"]].dropna()
-                    disp = dispersion_lorentz_fit(df_disp, p0={'center': 0.0, 'amplitude': DISP_P0_AMPL}, max_rel_err=0.01)
+                    df_disp = df_bs.rename(columns={"Ab": "x", "demod": "y"}).loc[:, ["x", "y"]].dropna()
+                    disp = dispersion_lorentz_fit(
+                        df_disp,
+                        p0={'center': 0.0, 'amplitude': cfg.DISP_P0_AMPL},
+                        max_rel_err=0.01
+                    )
                     slope_val = float(disp["Slope"]); slope_R2  = float(disp["R2"])
             except Exception as e:
                 print(f"[WARN] {sub.name}: dispersion fit failed: {e}")
@@ -102,7 +117,8 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
         v_sigma = v_gamma = np.nan
 
         import warnings as _w
-        _w.filterwarnings("ignore", message=r"Using UFloat objects with std_dev==0.*", category=UserWarning, module=r"uncertainties\.core")
+        _w.filterwarnings("ignore", message=r"Using UFloat objects with std_dev==0.*",
+                          category=UserWarning, module=r"uncertainties\.core")
 
         lf = gf = vf = None
         if "B" in df_bs.columns and df_bs["B"].notna().any():
@@ -114,7 +130,6 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                     lorentz_R2   = first_scalar(lf.get("R2"))
                 except Exception as e:
                     print(f"[WARN] {sub.name}: Lorentz fit failed: {e}")
-            
             # === Gaussian fit ===
             if need_gau:
                 try:
@@ -123,21 +138,17 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                     gaussian_R2   = first_scalar(gf.get("R2"))
                 except Exception as e:
                     print(f"[WARN] {sub.name}: Gaussian fit failed: {e}")
-            
-            # === Voigt fit (handles new structured return + fallback) ===
+            # === Voigt fit（新版/舊版都支援） ===
             if need_voigt:
                 try:
                     vf = voigt_fit(df_bs[["B","Ab"]])
-
                     if isinstance(vf, dict) and "Voigt" in vf and "Params" in vf["Voigt"]:
-                        # New structured layout
                         voigt_params = vf["Voigt"]["Params"]
                         v_sigma = float(voigt_params.get("sigma", np.nan))
                         v_gamma = float(voigt_params.get("gamma", np.nan))
                         voigt_FWHM = float(vf["Voigt"].get("FWHM", np.nan))
                         vR2 = first_scalar(vf["Voigt"].get("R2", np.nan))
                     else:
-                        # Backward compatible flat layout
                         v_sigma = float(vf.get("sigma", np.nan))
                         v_gamma = float(vf.get("gamma", np.nan))
                         vR2 = first_scalar(vf.get("R2", np.nan))
@@ -147,7 +158,6 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                             L = 2.0*abs(v_gamma)
                             G = 2.0*np.sqrt(2.0*np.log(2.0))*abs(v_sigma)
                             voigt_FWHM = 0.5346*L + np.sqrt(0.2166*L*L + G*G)
-
                     if isinstance(vf, dict) and "ModelSelected" in vf and "AIC_BIC" in vf:
                         try:
                             a = vf["AIC_BIC"]["AIC"]
@@ -155,27 +165,28 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                                   f"(AIC: G={a.get('G',np.nan):.1f}, L={a.get('L',np.nan):.1f}, V={a.get('V',np.nan):.1f})")
                         except Exception:
                             pass
-
                 except Exception as e:
                     print(f"[WARN] {sub.name}: Voigt fit failed: {e}")
 
-            # === Plotting ===
-            if PLOT_ENABLED and (need_lor or need_gau or need_voigt):
-                plot_save_lineshapes(sub, df_bs["B"].to_numpy(), df_bs["Ab"].to_numpy(),
-                                     need_lor, lf, need_gau, gf, need_voigt, vf)
+            if cfg.PLOT_ENABLED and (need_lor or need_gau or need_voigt):
+                plot_save_lineshapes(
+                    sub,
+                    df_bs["B"].to_numpy(), df_bs["Ab"].to_numpy(),
+                    need_lor, lf, need_gau, gf, need_voigt, vf
+                )
 
         # === Noise calculation ===
         noise_rms = np.nan
         if need_noise:
             try:
                 try:
-                    noise_csv = pick_noise_csv(sub / NOISE_SUBDIR)
+                    noise_csv = pick_noise_csv(sub / cfg.NOISE_SUBDIR)
                 except NameError:
                     noise_csv = None
                 if noise_csv is not None:
                     noise_df_raw = read_csv_safely(noise_csv)
-                    noise_df_std = standardize_noise_df(noise_df_raw)   # ➜ 兩欄 [time, signal]
-                    noise_rms = compute_noise(noise_df_std)             # ➜ 直接使用
+                    noise_df_std = standardize_noise_df(noise_df_raw)   # 兩欄 [time, signal]
+                    noise_rms = compute_noise(noise_df_std)
             except Exception as e:
                 print(f"[WARN] {session_dir.name}/{sub.name}: noise calc failed: {e}")
 
@@ -188,30 +199,33 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
         row = {
             "label": sub.name,
             "folder_name": str(sub),
-            SWEEP_COL_NAME: extract_sweep_value(sub.name),
+            cfg.SWEEP_COL_NAME: extract_sweep_value(sub.name),
             "B_range_used_nT": f"[{B_range_used[0]:.2f}, {B_range_used[1]:.2f}]",
         }
-        if _want("slope"):        row[METRIC_COLNAMES["slope"]]       = slope_val * 1e3
-        if _want("sloper2"):      row[METRIC_COLNAMES["sloper2"]]     = slope_R2
-        if _want("noisepsd"):     row[METRIC_COLNAMES["noisepsd"]]    = noise_rms * 1e6
-        if _want("sensitivity"):  row[METRIC_COLNAMES["sensitivity"]] = sensitivity * 1e3
-        if _want("lorentzfwhm"):  row[METRIC_COLNAMES["lorentzfwhm"]] = lorentz_FWHM
-        if _want("lorentzr2"):    row[METRIC_COLNAMES["lorentzr2"]]   = lorentz_R2
-        if _want("gaussianfwhm"): row[METRIC_COLNAMES["gaussianfwhm"]]= gaussian_FWHM
-        if _want("gaussianr2"):   row[METRIC_COLNAMES["gaussianr2"]]  = gaussian_R2
-        if _want("voigtfwhm"):    row[METRIC_COLNAMES["voigtfwhm"]]   = voigt_FWHM
-        if _want("voigtgamma"):   row[METRIC_COLNAMES["voigtgamma"]]  = v_gamma
-        if _want("voigtsigma"):   row[METRIC_COLNAMES["voigtsigma"]]  = v_sigma
-        if _want("voigtr2"):      row[METRIC_COLNAMES["voigtr2"]]     = vR2
+        if _want("slope"):        row[cfg.METRIC_COLNAMES["slope"]]       = slope_val * 1e3
+        if _want("sloper2"):      row[cfg.METRIC_COLNAMES["sloper2"]]     = slope_R2
+        if _want("noisepsd"):     row[cfg.METRIC_COLNAMES["noisepsd"]]    = noise_rms * 1e6
+        if _want("sensitivity"):  row[cfg.METRIC_COLNAMES["sensitivity"]] = sensitivity * 1e3
+        if _want("lorentzfwhm"):  row[cfg.METRIC_COLNAMES["lorentzfwhm"]] = lorentz_FWHM
+        if _want("lorentzr2"):    row[cfg.METRIC_COLNAMES["lorentzr2"]]   = lorentz_R2
+        if _want("gaussianfwhm"): row[cfg.METRIC_COLNAMES["gaussianfwhm"]]= gaussian_FWHM
+        if _want("gaussianr2"):   row[cfg.METRIC_COLNAMES["gaussianr2"]]  = gaussian_R2
+        if _want("voigtfwhm"):    row[cfg.METRIC_COLNAMES["voigtfwhm"]]   = voigt_FWHM
+        if _want("voigtgamma"):   row[cfg.METRIC_COLNAMES["voigtgamma"]]  = v_gamma
+        if _want("voigtsigma"):   row[cfg.METRIC_COLNAMES["voigtsigma"]]  = v_sigma
+        if _want("voigtr2"):      row[cfg.METRIC_COLNAMES["voigtr2"]]     = vR2
         rows.append(row)
 
-    dynamic_cols = ALWAYS_COLUMNS + [METRIC_COLNAMES[k] for k in METRIC_COLNAMES if k in _SELECT]
+    dynamic_cols = cfg.ALWAYS_COLUMNS + [cfg.METRIC_COLNAMES[k] for k in cfg.METRIC_COLNAMES if k in _SELECT]
     return pd.DataFrame(rows, columns=dynamic_cols)
 
 def process_root(root_dir: Path) -> pd.DataFrame:
     root_dir = root_dir.resolve()
-    warnings.filterwarnings("ignore", message=r"Using UFloat objects with std_dev==0.*",
-                            category=UserWarning, module=r"uncertainties\.core")
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Using UFloat objects with std_dev==0.*",
+        category=UserWarning, module=r"uncertainties\.core"
+    )
 
     rules_from_txt = load_experiment_rules(root_dir)
 

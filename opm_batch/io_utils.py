@@ -2,21 +2,62 @@
 from __future__ import annotations
 from pathlib import Path
 import pandas as pd, numpy as np, re
+from io import StringIO
 from typing import Tuple, List, Optional, Dict, Iterable
 from .config import (
     SCAN_CSV_GLOB, NOISE_SUBDIR, SCAN_USE_POSITION, NOISE_USE_POSITION,
     SCAN_POS_MAP, NOISE_POS_MAP, USER_SCAN_COLNAMES, USER_NOISE_COLNAMES
 )
+import os, re
+from pathlib import Path
 
 # -------------------------------
 # 基本讀檔
 # -------------------------------
 def read_csv_safely(csv_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(csv_path, engine="python", sep=None, comment="%", skip_blank_lines=True, encoding="utf-8-sig")
-    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
-    df.columns = [c.strip() for c in df.columns]
-    return df.reset_index(drop=True)
+    # 讀原始文字、去掉 BOM
+    txt = Path(csv_path).read_text(encoding="utf-8-sig")
+    txt = txt.lstrip("\ufeff")
 
+    # 先把設備註解行濾掉（同時支援 # 與 %）
+    lines = []
+    for ln in txt.splitlines():
+        s = ln.lstrip()
+        if not s or s.startswith("#") or s.startswith("%"):
+            continue
+        lines.append(ln)
+    payload = "\n".join(lines)
+
+    # 方案 A：明確用逗號分隔
+    try:
+        df = pd.read_csv(StringIO(payload),
+                         engine="python", sep=",",
+                         on_bad_lines="skip",  # 任何髒行跳過並警告
+                         skip_blank_lines=True)
+    except Exception:
+        df = None
+
+    # 方案 B：還是不行就改用自動偵測分隔
+    if df is None or df.shape[1] < 2:
+        try:
+            df = pd.read_csv(StringIO(payload),
+                             engine="python", sep=None,
+                             on_bad_lines="skip",
+                             skip_blank_lines=True)
+        except Exception:
+            df = None
+
+    # 方案 C：最後一招，當成「沒有表頭」讀進來
+    if df is None or df.shape[1] < 2:
+        df = pd.read_csv(StringIO(payload),
+                         engine="python", sep=",",
+                         header=None, on_bad_lines="skip",
+                         skip_blank_lines=True)
+
+    # 清理空欄/空列與欄名空白
+    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all").reset_index(drop=True)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 # -------------------------------
 # 尋找檔案
 # -------------------------------
@@ -241,11 +282,13 @@ def standardize_noise_df(
     return df.rename(columns={k: out_names.get(k, k) for k in df.columns})
 
 # -------------------------------
-# 規則檔解析（原樣）
+# 規則檔解析
 # -------------------------------
 def load_experiment_rules(root_dir: Path):
     p = root_dir / "實驗記錄.txt"
-    if not p.exists(): return []
+    print(f"Root: {p}")
+    if not p.exists():
+        return []
     txt = p.read_text(encoding="utf-8-sig")
     pattern = re.compile(
         r"(?P<lo>\d+(?:\.\d+)?)\s*~\s*(?P<hi>\d+(?:\.\d+)?)"
@@ -257,19 +300,69 @@ def load_experiment_rules(root_dir: Path):
     rules = []
     for line in txt.splitlines():
         m = pattern.search(line)
-        if not m: continue
+        if not m:
+            continue
         lo, hi = float(m.group("lo")), float(m.group("hi"))
-        lo, hi = (lo, hi) if lo <= hi else (hi, lo)
-        rules.append(dict(lo=lo, hi=hi, Bpm=float(m.group("Bpm")),
-                          mVpp=float(m.group("mVpp")), fmHz=float(m.group("fmHz"))))
+        if lo > hi:
+            lo, hi = hi, lo
+        rules.append(dict(
+            lo=lo, hi=hi,
+            Bpm=float(m.group("Bpm")),
+            mVpp=float(m.group("mVpp")),
+            fmHz=float(m.group("fmHz")),
+        ))
     return rules
 
 def choose_rule_for_label(rules: list, label: str):
-    m = re.search(r"([-+]?\d+(?:\.\d+)?)", label)
+    """
+    回傳：(B_range_tuple | None, meta | None)
+
+    進階控制（不改主流程也能用）：
+      - OPM_DISABLE_RULES=1         -> 一律不使用規則（回傳 None, None）
+      - OPM_FORCE_B_RANGE="a,b"     -> 直接強制使用 (a,b) 範圍（忽略規則）
+    例：export OPM_FORCE_B_RANGE="-62.32,62.32"
+        export OPM_DISABLE_RULES="1"
+    """
+    # 0) 一鍵停用規則
+    if os.getenv("OPM_DISABLE_RULES", "").strip() in ("1", "true", "True"):
+        return None, None
+
+    # 1) 強制 B 範圍覆寫（最高優先權）
+    fr = os.getenv("OPM_FORCE_B_RANGE", "").strip()
+    if fr:
+        try:
+            parts = [float(x) for x in re.split(r"[,\s]+", fr) if x]
+            if len(parts) >= 2:
+                a, b = parts[0], parts[1]
+                if a > b:
+                    a, b = b, a
+                return (a, b), {"source": "env_force"}
+        except Exception:
+            # 解析失敗就忽略，繼續走規則
+            pass
+
+    # 2) 沒規則就直接 None
+    if not rules:
+        return None, None
+
+    # 3) 從資料夾名稱抓數字（更穩健：抓第一個 float）
+    m = re.search(r"([-+]?\d+(?:\.\d+)?)", label or "")
     val = float(m.group(1)) if m else None
-    if val is None or not rules: return None, None
+    if val is None:
+        return None, None
+
+    # 4) 命中候選
     hits = [r for r in rules if r["lo"] <= val <= r["hi"]]
-    if not hits: return None, None
+    if not hits:
+        return None, None
+
+    # 5) 選擇範圍最窄、Bpm 最大的那條（與你原本策略一致）
     best = min(hits, key=lambda r: (r["hi"] - r["lo"], -r["Bpm"]))
-    Bpm = best["Bpm"]
-    return (-Bpm, Bpm), {"mVpp": best["mVpp"], "fmHz": best["fmHz"], "lo": best["lo"], "hi": best["hi"]}
+    Bpm = float(best["Bpm"])
+    return (-Bpm, Bpm), {
+        "mVpp": float(best["mVpp"]),
+        "fmHz": float(best["fmHz"]),
+        "lo": float(best["lo"]),
+        "hi": float(best["hi"]),
+        "source": "rules.txt",
+    }
