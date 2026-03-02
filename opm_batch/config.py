@@ -85,7 +85,9 @@ METRIC_COLNAMES = {
     "voigtgamma":   "voigt_gamma_nT",
     "voigtsigma":   "voigt_sigma_nT",
     "voigtr2":      "voigt_R2",
-    # NEW: Optional model selection metrics
+    "lorentzamp": "Lorentz_Amp (V)",
+    "gaussianamp": "Gauss_Amp (V)",
+    "voigtamp": "Voigt_Amp (V)",
     "voigt_model_selected": "voigt_best_model",
     "voigt_aic_g":          "voigt_AIC_Gaussian",
     "voigt_aic_l":          "voigt_AIC_Lorentzian",

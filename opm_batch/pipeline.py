@@ -30,7 +30,7 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
     rows = []
     subdirs = [p for p in sorted(session_dir.iterdir()) if p.is_dir() and p.name != cfg.NOISE_SUBDIR]
     if not subdirs:
-        subdirs = [session_dir]  # treat itself as one dataset
+        subdirs = [session_dir]
 
     for sub in subdirs:
         B_range_used, _ = choose_rule_for_label(rules_from_txt, sub.name)
@@ -48,7 +48,6 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
             print(f"[WARN] {session_dir.name}/{sub.name}: scan parse failed: {e}")
             continue
 
-        # === map to B and cut one segment ===
         try:
             BField, AbCut, DemodCut = one_cycle_cut(
                 df_scan.rename(columns={"tri": "tri"}),
@@ -63,13 +62,15 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
             print(f"[WARN] {session_dir.name}/{sub.name}: one_cycle_cut failed: {e}")
             df_bs = pd.DataFrame({"Ab": df_scan.get("Ab"), "demod": df_scan.get("demod")}).dropna()
 
+        # --- 1. 更新指標需求判定 (加入 amp) ---
         need_slope = _want("slope") or _want("sloper2") or _want("sensitivity")
         need_noise = _want("noisepsd") or _want("sensitivity")
-        need_voigt = any(_want(k) for k in ("voigtfwhm","voigtgamma","voigtsigma","voigtr2"))
-        need_lor   = any(_want(k) for k in ("lorentzfwhm","lorentzr2"))
-        need_gau   = any(_want(k) for k in ("gaussianfwhm","gaussianr2"))
+        need_voigt = any(_want(k) for k in ("voigtfwhm","voigtgamma","voigtsigma","voigtr2", "voigtamp"))
+        need_lor   = any(_want(k) for k in ("lorentzfwhm","lorentzr2", "lorentzamp"))
+        need_gau   = any(_want(k) for k in ("gaussianfwhm","gaussianr2", "gaussianamp"))
 
         slope_val = np.nan; slope_R2 = np.nan; disp = None
+        # ... (Dispersion fit 部分保持不變) ...
         if need_slope:
             try:
                 if "B" in df_bs.columns and df_bs["B"].notna().any():
@@ -112,9 +113,11 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
             except Exception as e:
                 print(f"[WARN] {sub.name}: dispersion fit failed: {e}")
 
+        # --- 2. 初始化線型變數 ---
         lorentz_FWHM = gaussian_FWHM = voigt_FWHM = np.nan
         lorentz_R2 = gaussian_R2 = vR2 = np.nan
         v_sigma = v_gamma = np.nan
+        lorentz_AMP = gaussian_AMP = voigt_AMP = np.nan # 新增
 
         import warnings as _w
         _w.filterwarnings("ignore", message=r"Using UFloat objects with std_dev==0.*",
@@ -128,6 +131,7 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                     lf = lorentz_fit(df_bs[["B","Ab"]])
                     lorentz_FWHM = float(lf["FWHM"]) if "FWHM" in lf else 2.0*abs(float(lf["gamma"]))
                     lorentz_R2   = first_scalar(lf.get("R2"))
+                    lorentz_AMP  = float(lf["Params"].get("amplitude", np.nan)) # 提取 Amp
                 except Exception as e:
                     print(f"[WARN] {sub.name}: Lorentz fit failed: {e}")
             # === Gaussian fit ===
@@ -136,21 +140,31 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                     gf = gauss_fit(df_bs[["B","Ab"]])
                     gaussian_FWHM = float(gf["FWHM"]) if "FWHM" in gf else 2.0*np.sqrt(2.0*np.log(2.0))*abs(float(gf["sigma"]))
                     gaussian_R2   = first_scalar(gf.get("R2"))
+                    gaussian_AMP  = float(gf["Params"].get("amplitude", np.nan)) # 提取 Amp
                 except Exception as e:
                     print(f"[WARN] {sub.name}: Gaussian fit failed: {e}")
-            # === Voigt fit（新版/舊版都支援） ===
+            # === Voigt fit ===
             if need_voigt:
                 try:
                     vf = voigt_fit(df_bs[["B","Ab"]])
                     if isinstance(vf, dict) and "Voigt" in vf and "Params" in vf["Voigt"]:
+                        # 新版結構
                         voigt_params = vf["Voigt"]["Params"]
                         v_sigma = float(voigt_params.get("sigma", np.nan))
                         v_gamma = float(voigt_params.get("gamma", np.nan))
+                        voigt_AMP = float(voigt_params.get("amplitude", np.nan)) # 提取 Amp
                         voigt_FWHM = float(vf["Voigt"].get("FWHM", np.nan))
                         vR2 = first_scalar(vf["Voigt"].get("R2", np.nan))
                     else:
+                        # 舊版結構
                         v_sigma = float(vf.get("sigma", np.nan))
                         v_gamma = float(vf.get("gamma", np.nan))
+                        # 如果 Params 存在於頂層
+                        if "Params" in vf:
+                             voigt_AMP = float(vf["Params"].get("amplitude", np.nan))
+                        else:
+                             voigt_AMP = float(vf.get("amplitude", np.nan))
+                             
                         vR2 = first_scalar(vf.get("R2", np.nan))
                         if "FWHM" in vf:
                             voigt_FWHM = float(vf["FWHM"])
@@ -158,13 +172,14 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                             L = 2.0*abs(v_gamma)
                             G = 2.0*np.sqrt(2.0*np.log(2.0))*abs(v_sigma)
                             voigt_FWHM = 0.5346*L + np.sqrt(0.2166*L*L + G*G)
+                    
+                    # 打印 AIC 資訊 (保持原樣)
                     if isinstance(vf, dict) and "ModelSelected" in vf and "AIC_BIC" in vf:
                         try:
                             a = vf["AIC_BIC"]["AIC"]
                             print(f"[INFO] {sub.name}: Best model = {vf['ModelSelected']} "
                                   f"(AIC: G={a.get('G',np.nan):.1f}, L={a.get('L',np.nan):.1f}, V={a.get('V',np.nan):.1f})")
-                        except Exception:
-                            pass
+                        except Exception: pass
                 except Exception as e:
                     print(f"[WARN] {sub.name}: Voigt fit failed: {e}")
 
@@ -175,27 +190,23 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
                     need_lor, lf, need_gau, gf, need_voigt, vf
                 )
 
-        # === Noise calculation ===
+        # === Noise & Sensitivity (保持原樣) ===
         noise_rms = np.nan
         if need_noise:
             try:
-                try:
-                    noise_csv = pick_noise_csv(sub / cfg.NOISE_SUBDIR)
-                except NameError:
-                    noise_csv = None
+                noise_csv = pick_noise_csv(sub / cfg.NOISE_SUBDIR)
                 if noise_csv is not None:
                     noise_df_raw = read_csv_safely(noise_csv)
-                    noise_df_std = standardize_noise_df(noise_df_raw)   # 兩欄 [time, signal]
+                    noise_df_std = standardize_noise_df(noise_df_raw)
                     noise_rms = compute_noise(noise_df_std)
             except Exception as e:
                 print(f"[WARN] {session_dir.name}/{sub.name}: noise calc failed: {e}")
 
-        # === Sensitivity calculation ===
         sensitivity = np.nan
         if _want("sensitivity") and np.isfinite(noise_rms) and np.isfinite(slope_val) and slope_val != 0:
             sensitivity = noise_rms / abs(slope_val)
 
-        # === Build output row ===
+        # === 3. 建立輸出 Row (加入 amp) ===
         row = {
             "label": sub.name,
             "folder_name": str(sub),
@@ -206,14 +217,22 @@ def process_session(session_dir: Path, rules_from_txt: list, root_dir: Path) -> 
         if _want("sloper2"):      row[cfg.METRIC_COLNAMES["sloper2"]]     = slope_R2
         if _want("noisepsd"):     row[cfg.METRIC_COLNAMES["noisepsd"]]    = noise_rms * 1e6
         if _want("sensitivity"):  row[cfg.METRIC_COLNAMES["sensitivity"]] = sensitivity * 1e3
+        
+        # 線型指標
         if _want("lorentzfwhm"):  row[cfg.METRIC_COLNAMES["lorentzfwhm"]] = lorentz_FWHM
+        if _want("lorentzamp"):   row[cfg.METRIC_COLNAMES["lorentzamp"]]  = lorentz_AMP   # 新增
         if _want("lorentzr2"):    row[cfg.METRIC_COLNAMES["lorentzr2"]]   = lorentz_R2
+        
         if _want("gaussianfwhm"): row[cfg.METRIC_COLNAMES["gaussianfwhm"]]= gaussian_FWHM
+        if _want("gaussianamp"):  row[cfg.METRIC_COLNAMES["gaussianamp"]] = gaussian_AMP  # 新增
         if _want("gaussianr2"):   row[cfg.METRIC_COLNAMES["gaussianr2"]]  = gaussian_R2
+        
         if _want("voigtfwhm"):    row[cfg.METRIC_COLNAMES["voigtfwhm"]]   = voigt_FWHM
+        if _want("voigtamp"):     row[cfg.METRIC_COLNAMES["voigtamp"]]    = voigt_AMP     # 新增
         if _want("voigtgamma"):   row[cfg.METRIC_COLNAMES["voigtgamma"]]  = v_gamma
         if _want("voigtsigma"):   row[cfg.METRIC_COLNAMES["voigtsigma"]]  = v_sigma
         if _want("voigtr2"):      row[cfg.METRIC_COLNAMES["voigtr2"]]     = vR2
+        
         rows.append(row)
 
     dynamic_cols = cfg.ALWAYS_COLUMNS + [cfg.METRIC_COLNAMES[k] for k in cfg.METRIC_COLNAMES if k in _SELECT]
